@@ -148,7 +148,18 @@ class PPO:
         self.transition.critic_observations = critic_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
+    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs, next_critic_obs_for_bootstrap=None):
+        """Process environment step with optional termination observation bootstrapping.
+        
+        Args:
+            rewards: Rewards from the environment
+            dones: Done flags
+            infos: Additional information dict
+            next_obs: Next policy observations (unused, kept for compatibility)
+            next_critic_obs: Next critic observations (current step)
+            next_critic_obs_for_bootstrap: Next critic observations with termination obs replaced (optional)
+                If provided, this will be used for bootstrapping instead of next_critic_obs.
+        """
         self.transition.rewards = rewards.clone()
 
         auxiliary_rewards = self.compute_auxiliary_reward(infos["observations"])
@@ -164,10 +175,16 @@ class PPO:
             infos["step"][k] = v
 
         self.transition.dones = dones
+        
         # Bootstrapping on time outs
-        if "time_outs" in infos:
+        # If next_critic_obs_for_bootstrap is provided, use it for bootstrapping
+        bootstrap_obs = next_critic_obs_for_bootstrap if next_critic_obs_for_bootstrap is not None else next_critic_obs
+        if "time_outs" in infos and bootstrap_obs is not None:
+            # Compute values for next state to bootstrap truncated episodes
+            with torch.no_grad():
+                bootstrap_values = self.actor_critic.evaluate(bootstrap_obs).detach()
             self.transition.rewards += (
-                self.gamma * self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device)
+                self.gamma * bootstrap_values * infos["time_outs"].unsqueeze(1).to(self.device)
             )
 
         # Record the transition
