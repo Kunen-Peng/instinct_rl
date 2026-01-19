@@ -233,15 +233,25 @@ class OnPolicyRunner:
 
         ep_string = f""
         if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
+            # Collect all keys from all ep_infos to handle inconsistent keys
+            all_keys = set()
+            for ep_info in locs["ep_infos"]:
+                all_keys.update(ep_info.keys())
+            for key in all_keys:
                 infotensor = []
                 for ep_info in locs["ep_infos"]:
+                    # Skip if key not present in this ep_info
+                    if key not in ep_info:
+                        continue
                     # handle scalar and zero dimensional tensor infos
                     if not isinstance(ep_info[key], torch.Tensor):
                         ep_info[key] = torch.Tensor([ep_info[key]])
                     if len(ep_info[key].shape) == 0:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     infotensor.append(ep_info[key].to(self.device))
+                # Skip if no valid tensor data collected for this key
+                if not infotensor:
+                    continue
                 infotensor = torch.cat(infotensor)
                 if "_max" in key:
                     value = self.gather_stat_values(infotensor, "max")
@@ -256,10 +266,17 @@ class OnPolicyRunner:
                 )
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         if locs["step_infos"]:
-            for key in locs["step_infos"][0]:
+            # Collect all keys from all step_infos to handle inconsistent keys
+            all_step_keys = set()
+            for step_info in locs["step_infos"]:
+                all_step_keys.update(step_info.keys())
+            for key in all_step_keys:
                 infotensor = []
                 texts = []
                 for step_info in locs["step_infos"]:
+                    # Skip if key not present in this step_info
+                    if key not in step_info:
+                        continue
                     # handle scalar and zero dimensional tensor infos
                     if isinstance(step_info[key], str):
                         texts.append(step_info[key])
@@ -269,6 +286,15 @@ class OnPolicyRunner:
                     if len(step_info[key].shape) == 0:
                         step_info[key] = step_info[key].unsqueeze(0)
                     infotensor.append(step_info[key].to(self.device))
+                # Skip if no valid tensor data collected for this key (only texts or missing)
+                if not infotensor:
+                    if len(texts) > 0 and (not self.is_mp_rank_other_process()):
+                        self.writer.add_text(
+                            (key if key.startswith("Step") else "Step/" + key),
+                            "\n".join(texts),
+                            self.current_learning_iteration,
+                        )
+                    continue
                 infotensor = torch.cat(infotensor)
                 if "_max" in key:
                     value = self.gather_stat_values(infotensor, "max")

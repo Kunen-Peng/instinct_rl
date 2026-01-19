@@ -33,6 +33,7 @@ class EstimatorMixin:
         estimator_target_components: list[str] = None,  # a list of strings used to get obs slices
         estimator_configs=dict(),
         replace_state_prob=0.0,  # if 0~1, replace the actor observation with the estimated state with this probability
+        target_from_critic=True,  # if True, get target dimensions from critic obs; else from policy obs
         **kwargs,
     ):
         super().__init__(
@@ -40,17 +41,26 @@ class EstimatorMixin:
             obs_format=obs_format,
             **kwargs,
         )
+        self.__obs_format = obs_format  # Store full obs_format for estimator target sizing
         self.__obs_segments = obs_format["policy"]
         self.estimator_obs_components = estimator_obs_components
         self.estimator_target_components = estimator_target_components
         self.estimator_configs = estimator_configs
         self.replace_state_prob = replace_state_prob
+        self.target_from_critic = target_from_critic
         self.build_estimator(**kwargs)
 
     def build_estimator(self, **kwargs):
         """This implementation is not flexible enough, but it is enough for now."""
         estimator_input_size = get_subobs_size(self.obs_segments, self.estimator_obs_components)
-        estimator_output_size = get_subobs_size(self.obs_segments, self.estimator_target_components)
+        # Select obs_segments based on target_from_critic:
+        # - True: use critic obs (for privileged targets like base_lin_vel)
+        # - False: use policy obs (targets must exist in policy obs)
+        if self.target_from_critic:
+            target_obs_segments = self._EstimatorMixin__obs_format.get("critic", self.obs_segments)
+        else:
+            target_obs_segments = self.obs_segments
+        estimator_output_size = get_subobs_size(target_obs_segments, self.estimator_target_components)
         if self.is_recurrent:
             # estimate required state using a recurrent network
             self.memory_s = Memory(

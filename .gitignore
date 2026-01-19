@@ -162,3 +162,5 @@ cython_debug/
 # Files for current project
 .DS_Store
 .vscode/
+
+logs
