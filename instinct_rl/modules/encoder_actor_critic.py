@@ -114,18 +114,25 @@ class EncoderActorCriticMixin:
     def critic_obs_segments(self):
         return self.__critic_obs_segments
 
-    def export_as_onnx(self, observations, filedir, encoder_as_seperate_file=True):
+    def export_as_onnx(self, observations, filedir, encoder_as_seperate_file=True, input_transform=None):
         """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1."""
         self.eval()
         if encoder_as_seperate_file:
+            if input_transform is not None:
+                raise ValueError(
+                    "Exporting encoder and actor as separate files is not supported when an input transform is provided. "
+                    "Re-run export with encoder_as_seperate_file=False to embed the normalizer into the combined graph."
+                )
             self.encoders.export_as_onnx(observations, filedir, encoder_as_seperate_file)
             with torch.no_grad():
                 obs = self.encoders(observations)
             super().export_as_onnx(obs, filedir)
         else:
+            export_target = self if input_transform is None else _InputTransformWrapper(input_transform, self)
+            export_target.eval()
             with torch.no_grad():
                 exported_program = torch.onnx.export(
-                    self,
+                    export_target,
                     observations,
                     "/tmp/encoder_actor_critic.onnx",
                     # This file does not contain the model weight, we call the save later to save the onnx with model weight.
@@ -136,6 +143,18 @@ class EncoderActorCriticMixin:
                 )
                 exported_program.save(os.path.join(filedir, "encoder_actor_critic.onnx"))
                 print(f"Exported encoder_actor_critic to {os.path.join(filedir, 'encoder_actor_critic.onnx')}")
+
+
+class _InputTransformWrapper(nn.Module):
+    """Prepends an input transform before running the wrapped encoder-actor module when exporting to ONNX."""
+
+    def __init__(self, input_transform: nn.Module, module: nn.Module):
+        super().__init__()
+        self.input_transform = input_transform
+        self.module = module
+
+    def forward(self, observations):  # pragma: no cover - deterministic glue
+        return self.module(self.input_transform(observations))
 
 
 from .actor_critic import ActorCritic

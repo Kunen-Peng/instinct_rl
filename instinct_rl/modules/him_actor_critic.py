@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -303,15 +303,19 @@ class HIMActorCritic(ActorCritic):
         """
         return self.history_size
 
-    def export_as_onnx(self, observations, filedir):
+    def export_as_onnx(self, observations, filedir, input_transform=None):
         """Export actor and estimator to ONNX format."""
         self.eval()
         import os
 
+        estimator_export = _EstimatorExportWrapper(self.estimator, input_transform)
+        estimator_export.eval()
+
+        processed_obs = input_transform(observations) if input_transform is not None else observations
         with torch.no_grad():
             # Export estimator (optional, mainly for documentation)
             torch.onnx.export(
-                self.estimator,
+                estimator_export,
                 observations,
                 os.path.join(filedir, "him_estimator.onnx"),
                 input_names=["obs_history"],
@@ -321,9 +325,9 @@ class HIMActorCritic(ActorCritic):
             print(f"Exported HIM Estimator to {os.path.join(filedir, 'him_estimator.onnx')}")
 
             # Export full actor
-            vel, latent = self.estimator(observations)
+            vel, latent = self.estimator(processed_obs)
             # Current observation is the newest (last num_one_step_obs elements)
-            current_obs = observations[:, -self.num_one_step_obs:]
+            current_obs = processed_obs[:, -self.num_one_step_obs:]
             actor_input = torch.cat((current_obs, vel, latent), dim=-1)
             
             torch.onnx.export(
@@ -335,3 +339,17 @@ class HIMActorCritic(ActorCritic):
                 opset_version=12,
             )
             print(f"Exported HIM Actor to {os.path.join(filedir, 'actor.onnx')}")
+
+
+class _EstimatorExportWrapper(torch.nn.Module):
+    """Wraps the HIM estimator so that an input transform is traced into the ONNX graph."""
+
+    def __init__(self, estimator: torch.nn.Module, input_transform: Optional[torch.nn.Module]):
+        super().__init__()
+        self.estimator = estimator
+        self.input_transform = input_transform
+
+    def forward(self, observations):  # pragma: no cover - deterministic wrapper
+        if self.input_transform is not None:
+            observations = self.input_transform(observations)
+        return self.estimator(observations)

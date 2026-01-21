@@ -29,7 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -123,15 +123,15 @@ class ActorCriticRecurrent(ActorCritic):
     def get_hidden_states(self):
         return ActorCriticHiddenState(self.memory_a.hidden_states, self.memory_c.hidden_states)
 
-    def export_as_onnx(self, observations, filedir):
+    def export_as_onnx(self, observations, filedir, input_transform=None):
         assert isinstance(self.memory_a.rnn, torch.nn.GRU), "ONNX export only supports GRU for now."
 
-        model = OnnxMemoryActor(self.memory_a.rnn, self.actor)
+        model = OnnxMemoryActor(self.memory_a.rnn, self.actor, input_transform=input_transform)
         model.eval()
         hidden_states = torch.zeros(self.memory_a.rnn.num_layers, 1, self.memory_a.rnn.hidden_size).to(
             observations.device
         )
-        exported_program = torch.onnx.export(
+        torch.onnx.export(
             model,
             (observations, hidden_states),
             os.path.join(filedir, "actor.onnx"),
@@ -226,12 +226,15 @@ class MemoryList(torch.nn.ModuleList):
 
 
 class OnnxMemoryActor(torch.nn.Module):
-    def __init__(self, rnn: torch.nn.GRU, mlp):
+    def __init__(self, rnn: torch.nn.GRU, mlp: torch.nn.Module, input_transform: Optional[torch.nn.Module] = None):
         super().__init__()
         self.rnn = rnn
         self.mlp = mlp
+        self.input_transform = input_transform
 
     def forward(self, input: torch.Tensor, hidden_states: torch.Tensor):
+        if self.input_transform is not None:
+            input = self.input_transform(input)
         out, hidden_states = self.rnn(input.unsqueeze(0), hidden_states)
         out = self.mlp(out.squeeze(0))
         return out, hidden_states

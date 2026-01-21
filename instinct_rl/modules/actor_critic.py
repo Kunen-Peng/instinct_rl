@@ -199,12 +199,14 @@ class ActorCritic(nn.Module):
     def critic_obs_segments(self):
         return self.__critic_obs_segments
 
-    def export_as_onnx(self, observations, filedir):
-        """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1."""
+    def export_as_onnx(self, observations, filedir, input_transform=None):
+        """Export the actor network as an ONNX file, optionally prepending an input transform."""
         self.eval()
+        export_module = self.actor if input_transform is None else _ActorExportModule(self.actor, input_transform)
+        export_module.eval()
         with torch.no_grad():
-            exported_program = torch.onnx.export(
-                self.actor,
+            torch.onnx.export(
+                export_module,
                 observations,
                 os.path.join(filedir, "actor.onnx"),
                 input_names=["input"],
@@ -212,6 +214,19 @@ class ActorCritic(nn.Module):
                 opset_version=12,
             )
             print(f"Exported ActorCritic model to {os.path.join(filedir, 'actor.onnx')}")
+
+
+class _ActorExportModule(nn.Module):
+    """Small wrapper that prepends an input transform before the actor during ONNX export."""
+
+    def __init__(self, actor: nn.Module, input_transform: nn.Module):
+        super().__init__()
+        self.actor = actor
+        self.input_transform = input_transform
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:  # pragma: no cover - simple wrapper
+        obs = self.input_transform(observations)
+        return self.actor(obs)
 
 
 def get_activation(act_name):

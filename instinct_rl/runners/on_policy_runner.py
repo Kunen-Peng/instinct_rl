@@ -501,11 +501,10 @@ class OnPolicyRunner:
 
     def export_as_onnx(self, obs, export_model_dir):
         self.eval_mode()
-        if "policy" in self.normalizers:
-            obs = self.normalizers["policy"](obs)
-            # also export obs normalizer
-            self.normalizers["policy"].export(os.path.join(export_model_dir, "policy_normalizer.npz"))
-        self.alg.actor_critic.export_as_onnx(obs, export_model_dir)
+        policy_normalizer = self.normalizers.get("policy")
+        if policy_normalizer is not None:
+            policy_normalizer = policy_normalizer.to(obs.device)
+        self.alg.actor_critic.export_as_onnx(obs, export_model_dir, input_transform=policy_normalizer)
 
     """
     Helper functions
