@@ -166,6 +166,16 @@ class EstimatorMixin:
         return return_
 
 
+    @property
+    def obs_segments(self):
+        """Override obs_segments to return the original policy obs segments for estimator."""
+        return self._EstimatorMixin__obs_segments
+
+    @property
+    def critic_obs_segments(self):
+        """Override critic_obs_segments to return the original critic obs segments for estimator."""
+        return self._EstimatorMixin__obs_format.get("critic", self._EstimatorMixin__obs_segments)
+
 class EstimatorActorCritic(EstimatorMixin, ActorCritic):
     pass
 

@@ -12,6 +12,7 @@ from .all_mixer import (
 from .discriminator import Discriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent
 from .him_estimator import HIMEstimator
+from .history_cat_estimator import HistoryCatEstimator
 from .him_actor_critic import HIMActorCritic
 from .moe_actor_critic import MoEActorCritic
 from .normalizer import (
