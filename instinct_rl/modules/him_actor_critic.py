@@ -1,6 +1,5 @@
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
@@ -10,18 +9,60 @@ from .actor_critic import ActorCritic, get_activation
 from .him_estimator import HIMEstimator
 
 
+def term_major_to_time_major(
+    obs_history: torch.Tensor, 
+    term_dims: List[int], 
+    history_length: int
+) -> torch.Tensor:
+    """Convert term-major observation history to time-major format.
+    
+    Term-major layout (mjlab default):
+        [A_t0, A_t1, ..., A_tH-1, B_t0, B_t1, ..., B_tH-1, ...]
+        All history of term A, then all history of term B, etc.
+        
+    Time-major layout (HIM expected):
+        [obs_t0, obs_t1, ..., obs_tH-1]
+        where obs_ti = concat(A_ti, B_ti, ...)
+        
+    Args:
+        obs_history: [batch_size, total_dim] where total_dim = sum(term_dims) * history_length
+        term_dims: List of dimensions for each observation term
+        history_length: Number of history timesteps
+        
+    Returns:
+        Tensor of shape [batch_size, history_length * sum(term_dims)] in time-major order
+    """
+    batch_size = obs_history.shape[0]
+    num_one_step_obs = sum(term_dims)
+    
+    # Split by term, each with shape [batch, term_dim * history_length]
+    term_chunks = torch.split(
+        obs_history, 
+        [dim * history_length for dim in term_dims], 
+        dim=-1
+    )
+    
+    # Reshape each term to [batch, history_length, term_dim]
+    term_histories = [
+        chunk.reshape(batch_size, history_length, dim) 
+        for chunk, dim in zip(term_chunks, term_dims)
+    ]
+    
+    # Concatenate along term dimension: [batch, history_length, num_one_step_obs]
+    time_major = torch.cat(term_histories, dim=-1)
+    
+    # Flatten back: [batch, history_length * num_one_step_obs]
+    return time_major.reshape(batch_size, -1)
+
+
 class HIMActorCritic(ActorCritic):
     """Hierarchical Imitation Mode (HIM) Actor-Critic network.
     
-    Extends standard ActorCritic by using a HIM Estimator to extract
-    velocity and latent features from observation history, enabling
-    more sample-efficient learning from expert demonstrations.
+    Reference: HIMLoco/rsl_rl/modules/him_actor_critic.py
     
-    The estimator processes observation history and outputs:
-    - Velocity estimation (3D)
-    - Latent features (learned via contrastive learning)
-    
-    The policy network uses [current_obs, velocity, latent] as input.
+    Supports both time-major and term-major observation layouts:
+    - time_major: [obs_t0, obs_t1, ..., obs_tH-1] (HIMLoco default)
+    - term_major: [A_t0..A_tH-1, B_t0..B_tH-1, ...] (mjlab default)
     """
 
     is_recurrent = False
@@ -29,7 +70,7 @@ class HIMActorCritic(ActorCritic):
     def __init__(
         self,
         obs_format: Dict[str, Dict[str, tuple]],
-        num_actions,
+        num_actions: int,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
@@ -42,27 +83,11 @@ class HIMActorCritic(ActorCritic):
         tar_hidden_dims=[128, 64],
         num_prototype=32,
         temperature=3.0,
+        # Observation layout parameters
+        obs_layout: str = "time_major",  # "time_major" or "term_major"
+        term_dims: Optional[List[int]] = None,  # Required if obs_layout="term_major"
         **kwargs,
     ):
-        """Initialize HIM Actor-Critic.
-        
-        Args:
-            obs_format: Observation format dictionary
-            num_actions: Number of actions
-            actor_hidden_dims: Actor hidden dimensions
-            critic_hidden_dims: Critic hidden dimensions
-            activation: Activation function name
-            init_noise_std: Initial noise standard deviation
-            num_rewards: Number of reward outputs
-            history_size: Number of observation history steps
-            num_one_step_obs: Dimension of single observation (auto-computed if None)
-            enc_hidden_dims: Estimator encoder hidden dimensions
-            tar_hidden_dims: Estimator target encoder hidden dimensions
-            num_prototype: Number of prototypes for contrastive learning
-            temperature: Temperature for softmax in estimator
-        """
-        # Note: We don't call super().__init__() immediately because we need to set up
-        # obs_format first based on HIM requirements
         
         nn.Module.__init__(self)  # Initialize nn.Module directly
 
@@ -82,16 +107,41 @@ class HIMActorCritic(ActorCritic):
         self.history_size = history_size
         self.num_one_step_obs = num_one_step_obs
         self.num_actions = num_actions
-
-        # Verify observation dimensions
-        if policy_obs_size != history_size * num_one_step_obs:
-            print(
-                f"[HIMActorCritic WARNING] Policy obs size ({policy_obs_size}) != "
-                f"history_size ({history_size}) * num_one_step_obs ({num_one_step_obs})"
-            )
+        
+        # Observation layout handling
+        self.obs_layout = obs_layout
+        if obs_layout == "term_major":
+            # Auto-infer term_dims from obs_segments if not provided
+            if term_dims is None:
+                # Each segment value is a tuple like (dim,) or (history, dim)
+                # For term-major with history, each term's flattened size = dim * history_length
+                # But obs_segments already reflects the flattened size per term
+                # We need the *single-step* dimension for each term
+                inferred_term_dims = []
+                for term_name, term_shape in self.__obs_segments.items():
+                    # term_shape is like (flattened_dim,) which equals (single_dim * history_length,)
+                    flat_dim = term_shape[0]
+                    single_dim = flat_dim // history_size
+                    if flat_dim % history_size != 0:
+                        raise ValueError(
+                            f"Term '{term_name}' has dim {flat_dim} which is not divisible by history_size={history_size}"
+                        )
+                    inferred_term_dims.append(single_dim)
+                term_dims = inferred_term_dims
+                print(f"[HIMActorCritic] Auto-inferred term_dims from obs_segments: {term_dims}")
+            self.term_dims = term_dims
+            # Validate
+            expected_total = sum(term_dims) * history_size
+            if expected_total != policy_obs_size:
+                raise ValueError(
+                    f"term_dims sum * history_size ({expected_total}) != policy_obs_size ({policy_obs_size})"
+                )
+            print(f"[HIMActorCritic] Using term-major layout with term_dims={term_dims}")
+        else:
+            self.term_dims = None
+            print(f"[HIMActorCritic] Using time-major layout (no conversion needed)")
 
         # Initialize HIM Estimator
-        # The estimator expects flattened history from ObservationManager (oldest_first format)
         self.estimator = HIMEstimator(
             temporal_steps=history_size,
             num_one_step_obs=num_one_step_obs,
@@ -100,13 +150,13 @@ class HIMActorCritic(ActorCritic):
             activation=activation,
             num_prototype=num_prototype,
             temperature=temperature,
-            history_format="oldest_first",  # Matches CircularBuffer output
+            history_format="oldest_first",
         )
 
         # Actor input dimension: current_obs + velocity(3) + latent_features
         mlp_input_dim_a = num_one_step_obs + 3 + enc_hidden_dims[-1]
         
-        # Critic input dimension (usually includes additional privileged observations)
+        # Critic input dimension
         mlp_input_dim_c = get_subobs_size(self.__critic_obs_segments)
 
         self.activation = activation
@@ -169,11 +219,23 @@ class HIMActorCritic(ActorCritic):
         return nn.Sequential(*critic_layers)
 
     def reset(self, dones=None):
-        """Reset any internal states (for recurrent networks)."""
         pass
 
     def forward(self):
         raise NotImplementedError
+    
+    def _convert_obs_layout(self, obs_history: torch.Tensor) -> torch.Tensor:
+        """Convert observation history to time-major format if needed.
+        
+        Args:
+            obs_history: [batch_size, total_dim] observation history
+            
+        Returns:
+            Observation history in time-major format for HIM processing
+        """
+        if self.obs_layout == "term_major" and self.term_dims is not None:
+            return term_major_to_time_major(obs_history, self.term_dims, self.history_size)
+        return obs_history
 
     @property
     def action_mean(self):
@@ -188,83 +250,39 @@ class HIMActorCritic(ActorCritic):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, obs_history):
-        """Update action distribution based on observation history.
+        # Convert to time-major if needed
+        obs_history_tm = self._convert_obs_layout(obs_history)
         
-        Extracts velocity and latent features from observation history, then feeds them
-        along with current observation to the actor network.
-        
-        The input obs_history is a flattened tensor from ObservationManager containing
-        the full history in order: [obs_t0, obs_t1, ..., obs_t(H-1)] where t0 is oldest
-        and t(H-1) is newest (when flatten_history_dim=True).
-        
-        Args:
-            obs_history: Flattened observation history tensor [batch_size, history_size * num_one_step_obs]
-        """
         with torch.no_grad():
-            vel, latent = self.estimator(obs_history)
+            vel, latent = self.estimator(obs_history_tm)
         
         # Extract current observation from history
         # For oldest_first format: current obs is the last num_one_step_obs elements
-        current_obs = obs_history[:, -self.num_one_step_obs:]
+        current_obs = obs_history_tm[:, -self.num_one_step_obs:]
         actor_input = torch.cat((current_obs, vel, latent), dim=-1)
         mean = self.actor(actor_input)
         self.distribution = Normal(mean, mean * 0.0 + self.std)
 
     def act(self, obs_history, **kwargs):
-        """Sample action from the learned policy.
-        
-        Args:
-            obs_history: Observation history tensor
-        
-        Returns:
-            Sampled actions
-        """
         self.update_distribution(obs_history)
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
-        """Get log probability of actions under current distribution.
-        
-        Args:
-            actions: Action tensor
-        
-        Returns:
-            Log probability sum over action dimensions
-        """
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, obs_history, **kwargs):
-        """Deterministic action selection for inference.
+        # Convert to time-major if needed
+        obs_history_tm = self._convert_obs_layout(obs_history)
         
-        Returns the mean of the action distribution (no sampling).
-        
-        The input obs_history is a flattened tensor from ObservationManager containing
-        the full history in order: [obs_t0, obs_t1, ..., obs_t(H-1)].
-        
-        Args:
-            obs_history: Flattened observation history tensor
-        
-        Returns:
-            Mean actions
-        """
         with torch.no_grad():
-            vel, latent = self.estimator(obs_history)
+            vel, latent = self.estimator(obs_history_tm)
         
-        # Extract current observation from history (newest observation)
-        current_obs = obs_history[:, -self.num_one_step_obs:]
+        current_obs = obs_history_tm[:, -self.num_one_step_obs:]
         actor_input = torch.cat((current_obs, vel, latent), dim=-1)
         actions_mean = self.actor(actor_input)
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
-        """Evaluate value function.
-        
-        Args:
-            critic_observations: Critic observation tensor(s)
-        
-        Returns:
-            Value predictions
-        """
         if hasattr(self, "critics") and isinstance(critic_observations, list):
             value = torch.cat(
                 [critic(critic_obs) for critic, critic_obs in zip(self.critics, critic_observations)],
@@ -278,29 +296,40 @@ class HIMActorCritic(ActorCritic):
         else:
             value = self.critic(critic_observations)
         return value
+    
+    def update_estimator(self, obs_history, next_critic_obs, lr=None):
+        """Update the HIM estimator with layout conversion.
+        
+        This method should be used instead of directly calling estimator.update()
+        as it applies the necessary observation layout conversion.
+        
+        Args:
+            obs_history: Observation history in environment format (may be term-major)
+            next_critic_obs: Next critic observations for contrastive learning
+            lr: Learning rate (optional)
+            
+        Returns:
+            Tuple of (estimation_loss, swap_loss)
+        """
+        # Convert observation history to time-major format if needed
+        obs_history_tm = self._convert_obs_layout(obs_history)
+        
+        return self.estimator.update(obs_history_tm, next_critic_obs, lr=lr)
 
     @torch.no_grad()
     def clip_std(self, min=None, max=None):
-        """Clip action standard deviation."""
         self.std.copy_(self.std.clip(min=min, max=max))
 
     @property
     def obs_segments(self):
-        """Observation segments for policy network."""
         return self.__obs_segments
 
     @property
     def critic_obs_segments(self):
-        """Observation segments for critic network."""
         return self.__critic_obs_segments
     
     @property
     def obs_history_length(self):
-        """Return the observation history length (temporal_steps).
-        
-        This property exposes the history length to runners and other modules
-        that need to know how many steps of history are expected.
-        """
         return self.history_size
 
     def export_as_onnx(self, observations, filedir, input_transform=None):
@@ -313,20 +342,8 @@ class HIMActorCritic(ActorCritic):
 
         processed_obs = input_transform(observations) if input_transform is not None else observations
         with torch.no_grad():
-            # Export estimator (optional, mainly for documentation)
-            torch.onnx.export(
-                estimator_export,
-                observations,
-                os.path.join(filedir, "him_estimator.onnx"),
-                input_names=["obs_history"],
-                output_names=["velocity", "latent"],
-                opset_version=12,
-            )
-            print(f"Exported HIM Estimator to {os.path.join(filedir, 'him_estimator.onnx')}")
-
             # Export full actor
             vel, latent = self.estimator(processed_obs)
-            # Current observation is the newest (last num_one_step_obs elements)
             current_obs = processed_obs[:, -self.num_one_step_obs:]
             actor_input = torch.cat((current_obs, vel, latent), dim=-1)
             
@@ -342,14 +359,12 @@ class HIMActorCritic(ActorCritic):
 
 
 class _EstimatorExportWrapper(torch.nn.Module):
-    """Wraps the HIM estimator so that an input transform is traced into the ONNX graph."""
-
-    def __init__(self, estimator: torch.nn.Module, input_transform: Optional[torch.nn.Module]):
+    def __init__(self, estimator: torch.nn.Module, input_transform: torch.nn.Module):
         super().__init__()
         self.estimator = estimator
         self.input_transform = input_transform
 
-    def forward(self, observations):  # pragma: no cover - deterministic wrapper
+    def forward(self, observations):
         if self.input_transform is not None:
             observations = self.input_transform(observations)
         return self.estimator(observations)
