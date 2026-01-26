@@ -26,6 +26,7 @@ from .state_estimator import (
     EstimatorMixin,
 )
 from .vae_actor import VaeActor
+from .cenet import CENet
 
 
 def build_actor_critic(

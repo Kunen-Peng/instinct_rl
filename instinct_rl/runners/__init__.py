@@ -32,6 +32,9 @@ from .demonstration import DemonstrationSaver
 from .on_policy_runner import OnPolicyRunner
 from .him_on_policy_runner import HIMOnPolicyRunner
 from .two_stage_runner import TwoStageRunner
+from .dreamwaq_runner import DreamWaQRunner
+from .on_constraint_policy_runner import OnConstraintPolicyRunner
+
 
 
 def build_runner(name, *args, **kwargs):

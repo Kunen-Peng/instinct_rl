@@ -35,6 +35,10 @@ from .him_ppo import HIMPPO
 from .tppo import TPPO
 from .vae_distill import VaeDistill
 from .wasabi import WasabiAlgoMixin, WasabiPPO
+from .dreamwaq import PPODreamWaQ
+from .np3o import NP3O
+
+
 
 
 class WasabiEstimatorPPO(WasabiAlgoMixin, EstimatorPPO):
@@ -55,4 +59,6 @@ __all__ = [
     "VaeDistill",
     "WasabiPPO",
     "WasabiEstimatorPPO",
+    "PPODreamWaQ",
+    "NP3O",
 ]
