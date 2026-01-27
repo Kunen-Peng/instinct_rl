@@ -54,19 +54,49 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
 
         obs_format = env.get_obs_format()
 
+        # Prepare cost args early to pass to ActorCritic
+        # Try to find cost shape and d_values from environment
+        cost_shape = getattr(self.env, 'cost_shape', None)
+        cost_d_values = getattr(self.env, 'cost_d_values', None)
+        
+        # If not direct attributes, maybe in cfg
+        if cost_shape is None and hasattr(self.env, 'cfg'):
+             try:
+                 # Try config dict style
+                 if isinstance(self.env.cfg, dict) and "costs" in self.env.cfg:
+                      cost_shape = (len(self.env.cfg["costs"]),)
+                 # Try object style
+                 elif hasattr(self.env.cfg, "costs"):
+                      cost_shape = (len(self.env.cfg.costs),)
+             except:
+                 pass
+        
+        # Check active terms from cost manager if wrapped env
+        if cost_shape is None and hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'cost_manager'):
+             try:
+                 cost_shape = (len(self.env.unwrapped.cost_manager.active_terms),)
+             except:
+                 pass
+
+        # Fallback to cfg
+        if cost_shape is None: 
+            cost_shape = self.cfg.get("cost_shape", None)
+            
+        num_costs = cost_shape[0] if cost_shape else 0
+
         actor_critic = modules.build_actor_critic(
             self.policy_cfg.pop("class_name"),
             self.policy_cfg,
             obs_format,
             num_actions=env.num_actions,
             num_rewards=env.num_rewards,
+            num_costs=num_costs,
         ).to(self.device)
 
         alg_class_name = self.alg_cfg.pop("class_name")
         alg_class = importlib.import_module(alg_class_name) if ":" in alg_class_name else getattr(algorithms, alg_class_name)
         
         # Check for k_value in env if needed by algorithm
-        # For NP3O, we might want to pass initial k_value if env has it
         if hasattr(self.env, 'cost_k_values'):
              self.alg_cfg['k_value'] = self.env.cost_k_values
              
@@ -86,28 +116,14 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
             )
             normalizer.to(self.device)
             self.normalizers[obs_group_name] = normalizer
-
-        # Prepare cost args
-        # Try to find cost shape and d_values from environment
-        cost_shape = getattr(self.env, 'cost_shape', None)
-        cost_d_values = getattr(self.env, 'cost_d_values', None)
-        
-        # If not direct attributes, maybe in cfg
-        if cost_shape is None and hasattr(self.env, 'cfg'):
-            # Attempt to reach into cfg structure from reference
-             try:
-                 cost_shape = [self.env.cfg.cost.num_costs]
-             except:
-                 pass
-        
+            
         if cost_d_values is None and hasattr(self.env, 'cost_d_values_tensor'):
              cost_d_values = self.env.cost_d_values_tensor
+
+        if cost_d_values is None and cost_shape is not None:
+             # Default to zero limits if not provided (assuming costs are already violations)
+             cost_d_values = torch.zeros(cost_shape, device=self.device)
              
-        # Fallback for compilation if env not ready yet (but this will likely crash run)
-        if cost_shape is None: 
-            # Check if user defined it in train_cfg by chance?
-            cost_shape = self.cfg.get("cost_shape", None)
-            
         # init storage and model
         self.alg.init_storage(
             self.env.num_envs,

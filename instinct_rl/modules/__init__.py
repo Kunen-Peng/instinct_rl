@@ -2,6 +2,7 @@ import importlib
 from typing import Dict
 
 from .actor_critic import ActorCritic
+from .actor_critic_with_cost import ActorCriticWithCost
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .all_mixer import (
     EncoderMoEActorCritic,
@@ -35,6 +36,7 @@ def build_actor_critic(
     obs_format: Dict[str, Dict[str, tuple]],
     num_actions: int,
     num_rewards: int,
+    num_costs: int = 0,
 ):
     """NOTE: This method allows to hack the policy kwargs by adding the env attributes to the policy_cfg."""
     if ":" in policy_class_name:
@@ -42,7 +44,18 @@ def build_actor_critic(
         module = importlib.import_module(module_name)
         actor_critic_class = getattr(module, class_name)
     else:
-        actor_critic_class = globals()[policy_class_name]  # ActorCritic
+        # Check globals first, then try to find in modules package if it's a known class
+        if policy_class_name in globals():
+             actor_critic_class = globals()[policy_class_name]
+        else:
+             # Fallback: try to match string to class in this module's scope effectively
+             # Since we imported ActorCriticWithCost, it should be available if we added it to globals() or logic here.
+             # But globals() only has what is imported.
+             # We imported ActorCriticWithCost above.
+             if policy_class_name == "ActorCriticWithCost":
+                 actor_critic_class = ActorCriticWithCost
+             else:
+                 actor_critic_class = globals().get(policy_class_name, ActorCritic) 
 
     policy_cfg = policy_cfg.copy()
 
@@ -57,6 +70,11 @@ def build_actor_critic(
 
     if not "num_rewards" in policy_cfg:
         policy_cfg["num_rewards"] = num_rewards
+        
+    # Inject num_costs only if the class supports it (e.g. ActorCriticWithCost)
+    # Or just inject it and let kwargs handle/ignore it if we added **kwargs to standard ActorCritic (we did)
+    if "num_costs" not in policy_cfg and num_costs > 0:
+        policy_cfg["num_costs"] = num_costs
 
     actor_critic: ActorCritic = actor_critic_class(**policy_cfg)
 

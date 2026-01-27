@@ -6,70 +6,6 @@ from instinct_rl.modules import CENet
 
 class DreamWaQRunner(OnPolicyRunner):
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
-        super().__init__(env, train_cfg, log_dir, device)
-        
-        # Instantiate CENet
-        # Assuming train_cfg["runner"]["cenet_class_name"] or similar exists, or hardcode/default
-        # Defaulting to CENet class we imported
-        if "cenet_class_name" in self.cfg:
-             # If dynamic loading needed, we can do it, but direct instantiation implies we trust the class
-             cenet_class_name = self.cfg["cenet_class_name"]
-             # Assuming it refers to instinct_rl.modules.cenet.CENet which we imported
-             # If it is a string like "CENet", we can use eval or globals if we imported it
-             pass 
-             
-        # Initialize CENet
-        # We need num_encoder_obs and num_single_obs
-        # num_single_obs is likely num_obs (raw)
-        # num_encoder_obs is likely frame_stack * num_single_obs
-        
-        # The env usually provides these? In DWL they are props of env.
-        # base instinct_rl env might not have num_single_obs. We might need to config it.
-        # Fallback: num_single_obs = env.num_obs // frame_stack ? 
-        # Or look at policy cfg or env cfg.
-        
-        # In space_mjlab, num_obs is usually the full stacked obs if stacking is used.
-        # But wait, DreamWaQ CENet takes history.
-        
-        # Let's assume the user configures "num_single_obs" in the runner config or env has it.
-        # In DWL python code: self.env.num_encoder_obs, self.env.num_single_obs
-        
-        # We will try to get it from env, else cfg.
-        num_single_obs = getattr(self.env, "num_single_obs", None)
-        if num_single_obs is None:
-             num_single_obs = self.cfg.get("num_single_obs", self.env.num_obs) # Fallback to full obs?
-             
-        num_encoder_obs = getattr(self.env, "num_encoder_obs", None)
-        if num_encoder_obs is None:
-             num_encoder_obs = self.cfg.get("num_encoder_obs", self.env.num_obs)
-             
-        self.cenet = CENet(num_encoder_obs, num_single_obs).to(self.device)
-        
-        # Re-initialize algorithm with CENet
-        # super().__init__ initialized self.alg as PPO. We need PPODreamWaQ.
-        # But wait, OnPolicyRunner uses class_name from config.
-        # If config says "PPODreamWaQ", it will try to init it.
-        # But PPODreamWaQ init needs `cenet` arg which generic OnPolicyRunner doesn't pass.
-        # So independent of what super() did, we might need to re-init or patch.
-        
-        # Better approach: Override __init__ completely? Or let super fail? 
-        # super() calls self.alg = alg_class(...)
-        # If alg_class is PPODreamWaQ, it will fail due to missing `cenet`.
-        
-        # So we should probably override __init__ or part of the setup.
-        # Since we can't easily partially override __init__, we have to copy-paste most of it or accept re-init cost.
-        # But simple re-init means super() crashed.
-        
-        # Strategy: We assume the user configures "PPODreamWaQ" in config.
-        # To avoid super() crash, we can hack: 
-        # 1. Provide a dummy PPO class name to super, then replace self.alg.
-        # 2. Or Copy-Paste OnPolicyRunner structure.
-        
-        # Copy-Paste seems safer to ensure correct wiring.
-        pass
-
-    # We will overwrite __init__ to inject CENet
-    def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
@@ -77,18 +13,25 @@ class DreamWaQRunner(OnPolicyRunner):
         self.env = env
 
         # CENet Init
+        # Try to get from Env (priority), then Config
         num_single_obs = getattr(self.env, "num_single_obs", self.cfg.get("num_single_obs"))
-        num_encoder_obs = getattr(self.env, "num_encoder_obs", self.cfg.get("num_encoder_obs"))
         
-        if num_single_obs is None or num_encoder_obs is None:
-             raise ValueError("DreamWaQRunner requires num_single_obs and num_encoder_obs to be defined in Env or Runner Config")
+        # Default num_encoder_obs to env.num_obs (assuming full obs is input to encoder)
+        # This handles cases where num_encoder_obs is not explicitly config'd but implies full observation space
+        num_encoder_obs = getattr(self.env, "num_encoder_obs", self.cfg.get("num_encoder_obs", self.env.num_obs))
+        
+        if num_single_obs is None:
+             raise ValueError("DreamWaQRunner requires num_single_obs to be defined in Env or Runner Config")
+        
+        # Log to confirm resolution
+        print(f"[DreamWaQRunner] Initialized CENet with num_encoder_obs={num_encoder_obs}, num_single_obs={num_single_obs}")
 
         self.cenet = CENet(num_encoder_obs, num_single_obs).to(self.device)
         
         # Update obs_format to include estimator output
         # CENet output dim is est_z + est_v + est_h (default 16 + 3 + 0 = 19)
         # We can get it from self.cenet.encoder.model[-1].out_features if available or hardcode based on defaults
-        est_dim = self.cenet.encoder.model[-1].out_features
+        est_dim = self.cenet.latent_dim
         obs_format = env.get_obs_format()
         # Create a copy to avoid mutating original env property if reference (though get_obs_format usually returns new dict)
         obs_format["policy"]["estimator"] = (est_dim,)
@@ -145,9 +88,7 @@ class DreamWaQRunner(OnPolicyRunner):
         # We need to extract single_obs (last frame) from obs
         # obs shape: (num_envs, num_encoder_obs) where num_encoder_obs = history * single
         # single_obs = obs[..., -num_single_obs:]
-        num_single_obs = self.cenet.decoder.model[-1].out_features 
-        single_obs = obs[..., -num_single_obs:]
-        
+        num_single_obs = self.cenet.decoder.model[-1].out_features         
         # Act
         actions = self.alg.act(obs, critic_obs)
         
@@ -184,7 +125,7 @@ class DreamWaQRunner(OnPolicyRunner):
              rewards_noClip = rewards_noClip.to(self.device)
         
         # Process
-        self.alg.process_env_step(rewards, dones, infos, rewards_noClip, single_obs, next_obs, next_critic_obs)
+        self.alg.process_env_step(rewards, dones, infos, rewards_noClip, num_single_obs, next_obs, next_critic_obs)
         
         return next_obs, next_critic_obs, rewards, dones, infos
 

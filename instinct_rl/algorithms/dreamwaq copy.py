@@ -235,9 +235,9 @@ class PPODreamWaQ(PPO):
             est_mean = self.cenet.encoder_mean
             est_logvar = self.cenet.encoder_logvar # 注意：这里要是 log_std * 2
             
-            # 4. 计算 KL Loss (只针对 Context 部分: 后16维) 注意mean的维度
+            # 4. 计算 KL Loss (只针对 Context 部分: 后16维)
             # 确保 est_logvar 是 log(sigma^2)
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar - est_mean[:,-16:] ** 2 - torch.exp(est_logvar), dim=1))            
+            kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar[:,-16:] - est_mean[:,-16:] ** 2 - torch.exp(est_logvar[:,-16:]), dim=1))            
             
             # 5. 计算功能 Loss
             loss_vt = torch.nn.functional.mse_loss(est_mean[:,:3], lin_vel) # 速度估计用均值
