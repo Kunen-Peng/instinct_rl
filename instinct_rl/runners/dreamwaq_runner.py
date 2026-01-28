@@ -194,3 +194,59 @@ class DreamWaQRunner(OnPolicyRunner):
 
         return policy
 
+    def export_as_onnx(self, obs, export_model_dir, filename="policy.onnx"):
+        self.eval_mode()
+        
+        # Prepare components
+        policy_normalizer = self.normalizers.get("policy")
+        cenet = self.cenet
+        actor_critic = self.alg.actor_critic
+        
+        if policy_normalizer is not None:
+            policy_normalizer = policy_normalizer.to(obs.device)
+            
+        class DreamWaQOnnxWrapper(torch.nn.Module):
+            def __init__(self, normalizer, cenet, actor_critic):
+                super().__init__()
+                self.normalizer = normalizer
+                self.cenet = cenet
+                self.actor_critic = actor_critic
+                
+            def forward(self, obs):
+                # 1. Normalize
+                if self.normalizer is not None:
+                    obs = self.normalizer(obs)
+                
+                # 2. CENet Encoder (Inference uses mean)
+                # Note: cenet.encoder_inference already returns v_mean (dim depends on latent_dim)
+                # We need to make sure we are calling the right method or logic. 
+                # Checking cenet.py: encoder_inference returns v_mean corresponding to self.latent_dim
+                latent = self.cenet.encoder_inference(obs)
+                
+                # 3. Concat (Augment observation)
+                obs_aug = torch.cat((obs, latent), dim=-1)
+                
+                # 4. Actor Inference
+                return self.actor_critic.act_inference(obs_aug)
+
+        model = DreamWaQOnnxWrapper(policy_normalizer, cenet, actor_critic)
+        model.eval()
+        
+        import os
+        os.makedirs(export_model_dir, exist_ok=True)
+        export_path = os.path.join(export_model_dir, filename)
+        
+        torch.onnx.export(
+            model,
+            obs,
+            export_path,
+            verbose=True,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={
+                "obs": {0: "batch"},
+                "actions": {0: "batch"}
+            },
+            opset_version=11
+        )
+        print(f"DreamWaQ Policy exported to {export_path}")
