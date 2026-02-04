@@ -450,8 +450,13 @@ class OnPolicyRunner:
         )
         torch.save(run_state_dict, path)
 
-    def load(self, path):
-        """Load training state dict from file. Will not happen if in multi-process and not rank 0."""
+    def load(self, path, strict=True):
+        """Load training state dict from file. Will not happen if in multi-process and not rank 0.
+        
+        Args:
+            path: Path to the checkpoint file
+            strict: If False, allows loading mismatched checkpoints (missing/extra keys will be handled gracefully)
+        """
         if self.is_mp_rank_other_process():
             return
 
@@ -466,7 +471,13 @@ class OnPolicyRunner:
             )
             print("\033[1;36m Done: using a hacky way to load the model. \033[0m")
 
-        self.alg.load_state_dict(loaded_dict)
+        # Check if alg.load_state_dict supports strict parameter
+        import inspect
+        sig = inspect.signature(self.alg.load_state_dict)
+        if 'strict' in sig.parameters:
+            self.alg.load_state_dict(loaded_dict, strict=strict)
+        else:
+            self.alg.load_state_dict(loaded_dict)
 
         for group_name, normalizer in self.normalizers.items():
             if not f"{group_name}_normalizer_state_dict" in loaded_dict:

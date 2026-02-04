@@ -1,6 +1,7 @@
 from collections import namedtuple
 import torch
 from instinct_rl.storage import RolloutStorage
+from instinct_rl.utils import split_and_pad_trajectories
 
 class RolloutStorageWithCost(RolloutStorage):
     class Transition(RolloutStorage.Transition):
@@ -12,7 +13,13 @@ class RolloutStorageWithCost(RolloutStorage):
     def __init__(self, num_envs, num_transitions_per_env, obs_shape, critic_obs_shape, actions_shape, cost_shape, cost_d_values, device='cpu'):
         super().__init__(num_envs, num_transitions_per_env, obs_shape, critic_obs_shape, actions_shape, device=device)
         self.cost_shape = cost_shape
-        self.cost_d_values = cost_d_values
+        
+        # Target threshold (final goal) - never changes during training
+        self.target_cost_d_values = cost_d_values.clone() if cost_d_values is not None else None
+        # Active threshold (used for violation calculation) - may be relaxed for adaptive scheduling
+        self.active_cost_d_values = cost_d_values.clone() if cost_d_values is not None else None
+        # Backward compatibility alias
+        self.cost_d_values = self.active_cost_d_values
 
         self.costs = torch.zeros(num_transitions_per_env, num_envs, *cost_shape, device=self.device)
         self.cost_values = torch.zeros(num_transitions_per_env, num_envs, *cost_shape, device=self.device)
@@ -53,7 +60,18 @@ class RolloutStorageWithCost(RolloutStorage):
         
         # Cost violation
         # ((1 - gamma) * (returns - limit) + advantage_mean) / advantage_std
-        self.cost_violation = ((1. - gamma) * (self.cost_returns - self.cost_d_values) + cost_adv_mean.view(1, 1, -1)) / (cost_adv_std.view(1, 1, -1) + 1e-8)
+        # Use active thresholds for adaptive constraint scheduling
+        self.cost_violation = ((1. - gamma) * (self.cost_returns - self.active_cost_d_values) + cost_adv_mean.view(1, 1, -1)) / (cost_adv_std.view(1, 1, -1) + 1e-8)
+
+    def update_active_d_values(self, new_active_d):
+        """
+        Update active constraint thresholds for adaptive scheduling.
+        
+        Args:
+            new_active_d: New threshold values, shape (num_costs,)
+        """
+        if self.active_cost_d_values is not None:
+            self.active_cost_d_values.copy_(new_active_d)
 
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
         batch_size = self.num_envs * self.num_transitions_per_env

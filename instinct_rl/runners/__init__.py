@@ -34,6 +34,7 @@ from .him_on_policy_runner import HIMOnPolicyRunner
 from .two_stage_runner import TwoStageRunner
 from .dreamwaq_runner import DreamWaQRunner
 from .on_constraint_policy_runner import OnConstraintPolicyRunner
+from .dreamwaq_np3o_runner import DreamWaQNP3ORunner
 
 
 

@@ -1,37 +1,99 @@
+"""
+NP3O (Penalized Proximal Policy Optimization) Algorithm Implementation.
+
+Based on the P3O paper, this algorithm transforms constrained RL into unconstrained
+optimization using an exact penalty function:
+
+    L^{P3O}(θ) = L_R^{CLIP}(θ) + κ · Σ_i max{0, L_{C_i}^{CLIP}(θ)}
+
+Key Components:
+1. Dual Value Networks: Reward Critic + Cost Critic
+2. Cost Advantage calculation using GAE
+3. Cost Violation term with proper normalization
+4. ReLU truncation to ensure penalties only when violating constraints
+5. Adaptive κ (k_value) scheduling
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
-import math
 
 from instinct_rl.algorithms.ppo import PPO
 from instinct_rl.storage.rollout_storage_with_cost import RolloutStorageWithCost
 from instinct_rl.utils.utils import get_subobs_size
 
+
 class NP3O(PPO):
-    def __init__(self,
-                 actor_critic,
-                 k_value=1.0, # Default, will be updated from env
-                 cost_value_loss_coef=1.0,
-                 cost_viol_loss_coef=1.0,
-                 **kwargs):
+    """
+    NP3O: Penalized Proximal Policy Optimization for Constrained RL.
+    
+    Extends PPO with:
+    - Cost Critic network for estimating expected cumulative cost
+    - Cost advantage and violation term computation  
+    - Penalty-based constraint handling with ReLU truncation
+    """
+    
+    def __init__(
+        self,
+        actor_critic,
+        k_value=1.0,  # Penalty coefficient, can be tensor for multiple constraints
+        k_value_max=1.0,  # Maximum k_value cap
+        k_value_growth_rate=1.0004,  # Growth rate per update
+        k_warmup_iterations=100,  # κ stays at initial value during warmup
+        adaptive_alpha=0.02,  # Threshold relaxation factor for adaptive scheduling
+        cost_value_loss_coef=1.0,
+        cost_viol_loss_coef=1.0,
+        **kwargs
+    ):
         super().__init__(actor_critic, **kwargs)
         
+        # Store initial k_value for reference
+        self._initial_k_value = k_value
         self.k_value = k_value
+        self.k_value_max = k_value_max
+        self.k_value_growth_rate = k_value_growth_rate
+        self.k_warmup_iterations = k_warmup_iterations
+        self.adaptive_alpha = adaptive_alpha
         self.cost_value_loss_coef = cost_value_loss_coef
         self.cost_viol_loss_coef = cost_viol_loss_coef
         
-        # Override storage with None initially, will be initialized in init_storage
+        # Storage will be initialized in init_storage
         self.storage = None
 
-    def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1, cost_shape=None, cost_d_values=None):
+    def init_storage(
+        self, 
+        num_envs, 
+        num_transitions_per_env, 
+        obs_format, 
+        num_actions, 
+        num_rewards=1, 
+        cost_shape=None, 
+        cost_d_values=None
+    ):
+        """
+        Initialize rollout storage with cost tracking.
+        
+        Args:
+            cost_shape: Tuple indicating shape of cost vector, e.g., (num_costs,)
+            cost_d_values: Cost limits/thresholds, tensor of shape cost_shape
+        """
         self.transition = RolloutStorageWithCost.Transition()
         obs_size = get_subobs_size(obs_format["policy"])
         critic_obs_size = get_subobs_size(obs_format.get("critic")) if "critic" in obs_format else None
         
-        # Ensure cost_shape is provided
         if cost_shape is None:
             raise ValueError("cost_shape must be provided for NP3O")
+        
+        # Convert k_value to tensor if needed, matching cost dimensions
+        if not isinstance(self.k_value, torch.Tensor):
+            self.k_value = torch.tensor(
+                [self.k_value] * cost_shape[0] if isinstance(cost_shape, tuple) else [self.k_value],
+                dtype=torch.float32,
+                device=self.device
+            )
+        else:
+            self.k_value = self.k_value.to(self.device)
             
         self.storage = RolloutStorageWithCost(
             num_envs,
@@ -45,169 +107,252 @@ class NP3O(PPO):
         )
 
     def act(self, obs, critic_obs):
+        """
+        Sample action and record cost values for current state.
+        
+        Note: cost_values are computed here (similar to values in PPO),
+        but costs are filled in process_env_step() from environment output
+        (similar to rewards in PPO).
+        """
         action = super().act(obs, critic_obs)
-        # Add cost values to transition
-        self.transition.costs = torch.zeros(self.storage.num_envs, *self.storage.cost_shape, device=self.device) # Placeholder until process_env_step
-        self.transition.cost_values = self.actor_critic.evaluate_cost(critic_obs if critic_obs is not None else obs).detach()
+        
+        # Evaluate cost values using Cost Critic (analogous to value estimation)
+        with torch.no_grad():
+            critic_input = critic_obs if critic_obs is not None else obs
+            self.transition.cost_values = self.actor_critic.evaluate_cost(critic_input).detach()
+        
+        # Note: self.transition.costs is set in process_env_step(), not here
+        # This is the same pattern as rewards in PPO
+        
         return action
 
-    def process_env_step(self, rewards, costs, dones, infos, next_obs, next_critic_obs, next_critic_obs_for_bootstrap=None):
-        # Handle standard PPO processing but we need to intercept to add costs
-        # But PPO.process_env_step calls self.storage.add_transitions(self.transition) and clears it.
-        # So we need to populate cost info BEFORE calling super().process_env_step
-        # AND we need to handle cost bootstrapping.
+    def process_env_step(
+        self, 
+        rewards, 
+        costs, 
+        dones, 
+        infos, 
+        next_obs, 
+        next_critic_obs, 
+        next_critic_obs_for_bootstrap=None
+    ):
+        """
+        Process environment step with cost information.
         
-        # NOTE: Instantiate Transition with costs in init_storage
-        
+        Handles:
+        1. Recording costs from environment
+        2. Bootstrapping cost values for truncated episodes (time_outs)
+        """
+        # Record costs
         self.transition.costs = costs.clone()
         
-        # Bootstrapping for costs on time outs
+        # Handle timeout bootstrapping for costs
+        # When episode is truncated (time_out=1, done=1), we need to add
+        # bootstrapped future cost value to current cost
         bootstrap_obs = next_critic_obs_for_bootstrap if next_critic_obs_for_bootstrap is not None else next_critic_obs
-        if 'time_outs' in infos and bootstrap_obs is not None:
-             with torch.no_grad():
-                bootstrap_cost_values = self.actor_critic.evaluate_cost(bootstrap_obs).detach()
-                
-             # self.transition.costs += self.gamma * (self.transition.costs * infos['time_outs'].unsqueeze(1).to(self.device))
-             # Re-checking NP3O implementation:
-             # self.transition.costs += self.gamma * (self.transition.costs * infos['time_outs'].unsqueeze(1).to(self.device)) 
-             # Wait, the reference implementation adds gamma * costs * timeouts? 
-             # Reference: self.transition.costs += self.gamma * (self.transition.costs * infos['time_outs'].unsqueeze(1).to(self.device))
-             # This looks like it might be wrong in pure logical sense (should be bootstrapping with value), but I will follow reference for now OR correct if obviously wrong.
-             # Actually, if costs are per-step, bootstrapping means adding future expected cost.
-             # Reference implementation line 122: self.transition.costs += self.gamma * (self.transition.costs * infos['time_outs'].unsqueeze(1).to(self.device))
-             # This looks like it's trying to do something with the current cost? 
-             # BUT wait, the reference ALSO has self.transition.values update.
-             # Let's look at `process_env_step` in `np3o.py` provided.
-             # Line 121: self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
-             # Line 122: self.transition.costs += self.gamma * (self.transition.costs * infos['time_outs'].unsqueeze(1).to(self.device))
-             # This line 122 seems suspicious. It multiplies current costs by gamma? Usually we bootstrap with value.
-             # However, let's look at `rollout_storage.py` usage.
-             # Cost returns are computed using `compute_cost_returns`.
-             # `delta = self.costs[step] + next_is_not_terminal * gamma * next_values - self.cost_values[step]`
-             # If we modify `self.costs` directly for timeout, we are effectively modifying the reward (cost) signal for that step.
-             # If `time_outs` is 1, `next_is_not_terminal` usually becomes 0 (because done=1).
-             # So `delta = self.costs[step] - self.cost_values[step]`.
-             # If we want to correct for timeout where done=1 but we want to bootstrap, we usually modify reward/cost or value.
-             # Standard PPO modifies reward: `reward += gamma * value`.
-             # So `delta = (reward + gamma * value) - value`. This effectively makes `r + gamma * V_next` as the target.
-             # So for costs, we should likely do: `costs += gamma * cost_value`.
-             # The reference code `self.transition.costs += self.gamma * (self.transition.costs * ...)` seems like a bug or I am misinterpreting `self.transition.costs` there.
-             # Wait, maybe `self.transition.costs` IS the value? No, `self.transition.cost_values` exists.
-             # I will implement standard bootstrapping: `costs += gamma * cost_value_next`.
-             
-             self.transition.costs += self.gamma * bootstrap_cost_values * infos['time_outs'].unsqueeze(1).to(self.device)
-
-        # Call PPO's process_env_step
-        # NOTE: We can't easily use super().process_env_step because it calls storage.add_transitions then clears.
-        # But we already set self.transition.costs.
-        # So as long as we call super(), it will add to storage.
-        # Ensure our storage is RolloutStorageWithCost instance.
         
+        if 'time_outs' in infos and bootstrap_obs is not None:
+            time_outs = infos['time_outs'].to(self.device)
+            
+            with torch.no_grad():
+                bootstrap_cost_values = self.actor_critic.evaluate_cost(bootstrap_obs).detach()
+            
+            # Bootstrap: cost += gamma * V_cost(next_state) for timed-out episodes
+            # This corrects the TD target when done=True but episode was just truncated
+            self.transition.costs = self.transition.costs + self.gamma * bootstrap_cost_values * time_outs.unsqueeze(-1)
+
+        # Call parent's process_env_step (handles rewards, values, storage)
         super().process_env_step(rewards, dones, infos, next_obs, next_critic_obs, next_critic_obs_for_bootstrap)
 
     def compute_cost_returns(self, last_critic_obs):
-        last_cost_values = self.actor_critic.evaluate_cost(last_critic_obs).detach()
+        """
+        Compute cost returns and advantages using GAE.
+        Also computes normalized cost violation term.
+        """
+        with torch.no_grad():
+            last_cost_values = self.actor_critic.evaluate_cost(last_critic_obs).detach()
         self.storage.compute_cost_returns(last_cost_values, self.gamma, self.lam)
 
     def compute_cost_surrogate_loss(self, actions_log_prob_batch, old_actions_log_prob_batch, cost_advantages_batch):
+        """
+        Compute clipped surrogate loss for cost objective.
+        
+        Similar to PPO's reward surrogate, but for cost minimization:
+        - Uses max instead of min (we want to minimize cost, so maximize negative cost)
+        - Applies clipping to prevent large policy updates
+        
+        Returns:
+            cost_surrogate_loss: Shape (num_costs,) - per-constraint surrogate losses
+        """
+        # Compute probability ratio
         ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
         
-        # Reshape ratio to match cost_advantages? 
-        # cost_advantages_batch: [batch_size, num_costs]
-        # ratio: [batch_size, 1]
+        # Expand ratio to match cost dimensions: [batch_size] -> [batch_size, 1]
+        ratio_expanded = ratio.view(-1, 1)
         
-        surrogate = cost_advantages_batch * ratio.view(-1, 1)
-        surrogate_clipped = cost_advantages_batch * torch.clamp(ratio.view(-1, 1), 1.0 - self.clip_param, 1.0 + self.clip_param)
+        # Cost surrogate (note: we want to minimize cost, so use positive advantage)
+        surrogate = cost_advantages_batch * ratio_expanded
+        surrogate_clipped = cost_advantages_batch * torch.clamp(
+            ratio_expanded, 
+            1.0 - self.clip_param, 
+            1.0 + self.clip_param
+        )
         
-        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean(0)
+        # Take max (pessimistic for cost minimization) and mean over batch
+        # Returns shape: (num_costs,)
+        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean(dim=0)
+        
         return surrogate_loss
 
     def compute_viol(self, actions_log_prob_batch, old_actions_log_prob_batch, cost_advantages_batch, cost_violation_batch):
-        cost_surrogate_loss = self.compute_cost_surrogate_loss(actions_log_prob_batch, old_actions_log_prob_batch, cost_advantages_batch)
-        cost_violation_loss = cost_violation_batch.mean()
+        """
+        Compute the penalized constraint violation loss.
         
+        P3O Loss = κ · ReLU(Cost_Surrogate + Cost_Violation)
+        
+        The ReLU ensures:
+        - Gradient is 0 when policy is safe (cost < limit)
+        - Algorithm degrades to standard PPO when all constraints satisfied
+        
+        Args:
+            cost_advantages_batch: Normalized cost advantages, shape [batch, num_costs]
+            cost_violation_batch: Normalized violation term, shape [batch, num_costs]
+            
+        Returns:
+            Scalar penalty loss
+        """
+        # Compute cost surrogate loss per constraint, shape: (num_costs,)
+        cost_surrogate_loss = self.compute_cost_surrogate_loss(
+            actions_log_prob_batch, 
+            old_actions_log_prob_batch, 
+            cost_advantages_batch
+        )
+        
+        # Compute mean violation per constraint, shape: (num_costs,)
+        cost_violation_loss = cost_violation_batch.mean(dim=0)
+        
+        # Combined cost loss per constraint
         cost_loss = cost_surrogate_loss + cost_violation_loss
         
-        # Apply k_value weighting and ReLU
-        # k_value should be tensor of same shape or broadcastable? 
-        # In reference: `cost_loss = torch.sum(self.k_value*F.relu(cost_loss))`
-        
+        # Apply ReLU: only penalize when violating or likely to violate
+        # Then weight by k_value and sum across constraints
         cost_loss = torch.sum(self.k_value * F.relu(cost_loss))
+        
         return cost_loss
 
-    def update_k_value(self, i):
-         # Decay k_value
-         # self.k_value = torch.min(torch.ones_like(self.k_value), self.k_value * (1.0004**i))
-         # Wait, reference says `self.k_value*(1.0004**i)`. Power of positive number > 1 grows.
-         # So k_value grows? But min(1, ...) caps it at 1?
-         # Initial k_value in reference seems to come from env and might be small? or large?
-         # `self.alg_cfg['k_value'] = self.env.cost_k_values` in runner.
-         # If k_value starts small, it grows to 1.
-         
-         if isinstance(self.k_value, torch.Tensor):
-             self.k_value = torch.min(torch.ones_like(self.k_value), self.k_value * (1.0004))
-             # Note: Reference used `i` as exponent, here I assumed incremental update if called every epoch.
-             # Reference: `self.k_value = torch.min(torch.ones_like(self.k_value),self.k_value*(1.0004**i))` where `i` is iteration.
-             # So I should accept `i` and calculate or just update statefully.
-             # Let's stick to stateful update if consistent, or use `current_learning_iteration` from `update`.
-             pass
-         return self.k_value
+    def update_adaptive_constraints(self, current_mean_costs):
+        """
+        Update active constraint thresholds based on current rollout performance.
+        
+        Implements Kim et al. (2024) adaptive threshold strategy:
+        d_new = max(d_target, J_current - alpha * d_target)
+        
+        This creates a "moving goalpost" that's slightly better than current performance,
+        encouraging gradual improvement while avoiding overly aggressive penalties.
+        
+        Args:
+            current_mean_costs: Mean cost per constraint from current rollout, shape (num_costs,)
+            
+        Returns:
+            Updated active threshold values, or None if thresholds not configured
+        """
+        target_d = self.storage.target_cost_d_values
+        if target_d is None:
+            return None
+        
+        # Ensure tensors are on same device
+        if current_mean_costs.device != target_d.device:
+            current_mean_costs = current_mean_costs.to(target_d.device)
+        
+        # Calculate margin based on target threshold
+        margin = self.adaptive_alpha * target_d
+        
+        # New threshold: max(target, current - margin)
+        # This ensures the threshold is never below target, but can be relaxed above target
+        new_active_d = torch.max(target_d, current_mean_costs - margin)
+        
+        # Update storage with new active thresholds
+        self.storage.update_active_d_values(new_active_d)
+        
+        return new_active_d
+
+    def update_k_value(self):
+        """
+        Update penalty coefficient κ using exponential growth schedule.
+        
+        The k_value grows from initial value towards k_value_max to enforce
+        stricter constraint satisfaction as training progresses.
+        
+        Includes warmup period where k_value stays fixed to allow Cost Critic
+        to train before applying strong penalties.
+        """
+        # Skip growth during warmup period
+        if self.current_learning_iteration < self.k_warmup_iterations:
+            return
+            
+        if isinstance(self.k_value, torch.Tensor):
+            # Exponential growth with cap - use in-place operations to avoid memory allocation
+            self.k_value.mul_(self.k_value_growth_rate)
+            self.k_value.clamp_(max=self.k_value_max)
+        elif isinstance(self.k_value, (int, float)):
+            self.k_value = min(self.k_value_max, self.k_value * self.k_value_growth_rate)
 
     def update(self, current_learning_iteration):
-        # We need to override update to include cost losses
+        """
+        Perform NP3O policy update.
+        
+        Extends PPO update with:
+        1. Cost value loss (train Cost Critic)
+        2. Violation loss (penalized constraint objective)
+        3. K-value scheduling
+        """
         self.current_learning_iteration = current_learning_iteration
         
-        # Update k_value based on iteration
-        # Assuming self.k_value is a tensor
-        if isinstance(self.k_value, torch.Tensor):
-             device = self.k_value.device
-             # Re-calculate k-value based on iteration count to match reference exactly if possible, 
-             # OR just update it incrementally.
-             # Reference: self.k_value*(1.0004**i)
-             # But we don't know initial k_value if we overwrite it.
-             # So we should probably store initial k_value.
-             # But simpler is to assume k_value is updated outside or we just do it here.
-             # I will use the passed `current_learning_iteration`.
-             # But wait, `self.k_value` is updated in place in reference.
-             pass
-
         mean_losses = defaultdict(float)
         average_stats = defaultdict(float)
         
+        # Select appropriate batch generator
         if self.actor_critic.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
             
         for minibatch_data in generator:
-            # Unpack our augmented minibatch
-            # Generator yields: minibatch, target_cost_values_batch, cost_advantages_batch, cost_returns_batch, cost_violation_batch
+            # Unpack augmented minibatch
             minibatch = minibatch_data[0]
             target_cost_values_batch = minibatch_data[1]
             cost_advantages_batch = minibatch_data[2]
             cost_returns_batch = minibatch_data[3]
             cost_violation_batch = minibatch_data[4]
 
-            # Compute standard losses
+            # Step 1: Compute standard PPO losses (surrogate, value, entropy)
             losses, inter_vars, stats = self.compute_losses(minibatch)
             
-            # Compute Cost Values stats/loss
+            # Step 2: Compute Cost Critic loss
             critic_hidden_states = minibatch.hidden_states.critic if self.actor_critic.is_recurrent else None
-            # Evaluate cost
             cost_value_batch = self.actor_critic.evaluate_cost(
-                minibatch.critic_obs, masks=minibatch.masks, hidden_states=critic_hidden_states
+                minibatch.critic_obs, 
+                masks=minibatch.masks, 
+                hidden_states=critic_hidden_states
             )
             
-            # Cost Value Loss
+            # Cost Value Loss with optional clipping
             if self.use_clipped_value_loss:
-                cost_value_clipped = target_cost_values_batch + (cost_value_batch - target_cost_values_batch).clamp(-self.clip_param, self.clip_param)
+                cost_value_clipped = target_cost_values_batch + (
+                    cost_value_batch - target_cost_values_batch
+                ).clamp(-self.clip_param, self.clip_param)
+                
                 cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
                 cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
                 cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
             else:
                 cost_value_loss = (cost_returns_batch - cost_value_batch).pow(2).mean()
 
-            # Violation Loss
+            # Step 3: Compute Violation Loss (P3O core)
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(minibatch.actions)
             viol_loss = self.compute_viol(
                 actions_log_prob_batch, 
@@ -216,47 +361,65 @@ class NP3O(PPO):
                 cost_violation_batch
             )
 
-            # Combine losses
+            # Step 4: Combine all losses
             total_loss = 0.0
             
-            # PPO specific losses
+            # PPO losses (surrogate, value, entropy)
             for k, v in losses.items():
-                total_loss += getattr(self, k + "_coef", 1.0) * v
+                coef = getattr(self, k + "_coef", 1.0)
+                total_loss = total_loss + coef * v
                 mean_losses[k] += v.detach()
             
-            # Add NP3O specific losses
-            total_loss += self.cost_value_loss_coef * cost_value_loss
-            total_loss += self.cost_viol_loss_coef * viol_loss
+            # NP3O specific losses
+            total_loss = total_loss + self.cost_value_loss_coef * cost_value_loss
+            total_loss = total_loss + self.cost_viol_loss_coef * viol_loss
             
             mean_losses["cost_value_loss"] += cost_value_loss.detach()
             mean_losses["viol_loss"] += viol_loss.detach()
             mean_losses["total_loss"] += total_loss.detach()
 
-            # Stats
+            # Collect stats
             for k, v in stats.items():
                 average_stats[k] += v.detach()
             
-            # Gradient step
+            # Step 5: Gradient step
             self.gradient_step(total_loss, average_stats)
 
+        # Compute mean losses over all updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         for k in mean_losses.keys():
             mean_losses[k] /= num_updates
         for k in average_stats.keys():
             average_stats[k] /= num_updates
             
+        # Clear storage
         self.storage.clear()
+        
+        # Clip action std if needed
         if hasattr(self.actor_critic, "clip_std"):
             self.actor_critic.clip_std(min=self.clip_min_std)
 
-        # Update k_value reference style
+        # Step 6: Update penalty coefficient κ
+        self.update_k_value()
+        
+        # Add k_value to stats for logging
         if isinstance(self.k_value, torch.Tensor):
-             self.k_value = torch.min(torch.ones_like(self.k_value), self.k_value * (1.0004 ** (self.num_learning_epochs))) 
-             # Approximation roughly per epoch? Or just update once per update call.
-             # Reference updates once per `update()` call which happens after rollout.
-             # So I should update it once here.
-             # Reference used `i` (iteration) but passed it to update_k_value.
-             # Here I just multiply.
-             pass
+            average_stats["k_value_mean"] = self.k_value.mean()
+        else:
+            average_stats["k_value"] = self.k_value
 
         return mean_losses, average_stats
+
+    def state_dict(self):
+        """Save algorithm state including k_value."""
+        state = super().state_dict()
+        state["k_value"] = self.k_value
+        return state
+    
+    def load_state_dict(self, state_dict):
+        """Load algorithm state including k_value."""
+        if "k_value" in state_dict:
+            self.k_value = state_dict.pop("k_value")
+            if isinstance(self.k_value, torch.Tensor):
+                self.k_value = self.k_value.to(self.device)
+        super().load_state_dict(state_dict)
