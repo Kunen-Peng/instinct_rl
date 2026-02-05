@@ -241,10 +241,15 @@ class DreamWaQNP3O(NP3O):
         """
         # --- DreamWaQ Logic: Process "True" Next Obs for Estimator ---
         true_next_critic_obs = next_critic_obs.clone()
-        if "termination_observations" in infos and "critic" in infos["termination_observations"]:
+        if "termination_observations" in infos:
             term_ids = infos["termination_env_ids"]
             if len(term_ids) > 0:
-                true_next_critic_obs[term_ids] = infos["termination_observations"]["critic"]
+                term_obs = infos["termination_observations"]
+                if isinstance(term_obs, dict):
+                    if "critic" in term_obs:
+                        true_next_critic_obs[term_ids] = term_obs["critic"]
+                else:
+                    true_next_critic_obs[term_ids] = term_obs
         
         self.transition.single_obs = true_next_critic_obs[:,:num_single_obs]
         self.transition.rewards_noClip = rewards_noClip.clone()

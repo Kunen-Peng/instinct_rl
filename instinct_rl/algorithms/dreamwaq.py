@@ -142,11 +142,17 @@ class PPODreamWaQ(PPO):
         
         true_next_critic_obs = next_critic_obs.clone()
         
-        if "termination_observations" in infos and "critic" in infos["termination_observations"]:
-            term_ids = infos["termination_env_ids"]
-            if len(term_ids) > 0:
-                # 用“临终”观测值覆盖掉“新生”观测值
-                true_next_critic_obs[term_ids] = infos["termination_observations"]["critic"]
+        term_ids = infos["termination_env_ids"]
+        if len(term_ids) > 0:
+            # 用“临终”观测值覆盖掉“新生”观测值
+            # Handle both Dict (with "critic" key) and Tensor formats
+            term_obs = infos["termination_observations"]
+            if isinstance(term_obs, dict):
+                if "critic" in term_obs:
+                    true_next_critic_obs[term_ids] = term_obs["critic"]
+            else:
+                # Assume tensor is the critic obs directly if not dict
+                true_next_critic_obs[term_ids] = term_obs
         self.transition.single_obs = true_next_critic_obs[:,:num_single_obs]
         self.transition.rewards_noClip = rewards_noClip.clone()
         self.transition.rewards = rewards.clone()
