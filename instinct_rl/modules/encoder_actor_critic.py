@@ -167,5 +167,35 @@ class EncoderActorCritic(EncoderActorCriticMixin, ActorCritic):
 from .actor_critic_recurrent import ActorCriticRecurrent
 
 
+
 class EncoderActorCriticRecurrent(EncoderActorCriticMixin, ActorCriticRecurrent):
+    pass
+
+
+class StatefulEncoderActorCriticMixin(EncoderActorCriticMixin):
+    """
+    Experimental mixin to support stateful encoders.
+    Assumes encoders might have 'rnn' or be recurrent.
+    Passes 'encoder_hidden_states' to encoders.
+    """
+    def act_with_encoder_state(self, observations, masks=None, hidden_states=None, encoder_hidden_states=None, **kwargs):
+        # Handle Encoder State
+        if encoder_hidden_states is not None:
+             # Assuming encoder supports hidden_states arg
+             obs = self.encoders(observations, hidden_states=encoder_hidden_states, masks=masks)
+        else:
+             obs = self.encoders(observations)
+             
+        return super().act(obs, masks=masks, hidden_states=hidden_states, **kwargs)
+
+    def act_inference_with_encoder_state(self, observations, hidden_states=None, encoder_hidden_states=None):
+        if encoder_hidden_states is not None:
+            # Note: ParallelLayer might need updates to support passing states if used here.
+            # But for single encoder case or custom encoders, this provides the interface.
+            pass
+            
+        return super().act_inference(observations) 
+
+
+class StatefulEncoderActorCriticRecurrent(StatefulEncoderActorCriticMixin, ActorCriticRecurrent):
     pass

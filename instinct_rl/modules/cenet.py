@@ -19,6 +19,8 @@ class MLP(nn.Module):
         return self.model(x)
 
 
+from .actor_critic_recurrent import Memory
+
 class CENet(nn.Module):
     def __init__(self,
                  num_encoder_obs,
@@ -29,6 +31,9 @@ class CENet(nn.Module):
                  encoder_hidden_dim=[512, 256, 128],
                  decoder_hidden_dim=[64, 48],
                  activation=nn.ELU(),
+                 rnn_type=None, # [New]
+                 rnn_hidden_size=256, # [New]
+                 rnn_num_layers=1, # [New]
                  **kwargs):
         super(CENet, self).__init__()
         
@@ -42,8 +47,20 @@ class CENet(nn.Module):
         # Encoder 输出头维度 = v_mean(3) + z_mean(16) + z_logstd(16) = 35
         self.encoder_output_dim = self.dim_v + self.dim_z * 2
         
+        # [New] RNN Support
+        self.rnn = None
+        if rnn_type is not None:
+            self.rnn = Memory(input_size=num_encoder_obs, 
+                              type=rnn_type, 
+                              num_layers=rnn_num_layers, 
+                              hidden_size=rnn_hidden_size)
+            # Encoder input dim becomes rnn output dim (hidden size)
+            encoder_input_dim = rnn_hidden_size
+        else:
+            encoder_input_dim = num_encoder_obs
+
         # [修正 2] Encoder 输出 35 维
-        self.encoder = MLP(input_dim=num_encoder_obs,
+        self.encoder = MLP(input_dim=encoder_input_dim,
                            hidden_dims=encoder_hidden_dim,
                            output_dim=self.encoder_output_dim, # 35
                            activation=activation)
@@ -66,7 +83,8 @@ class CENet(nn.Module):
          enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))]
 
     def reset(self, dones=None):
-        pass
+        if self.rnn is not None:
+            self.rnn.reset(dones)
 
     def forward(self):
         raise NotImplementedError
@@ -79,8 +97,32 @@ class CENet(nn.Module):
     def encoder_logvar(self):
         return self.z_logvar # [Batch, 16] (只包含 z 的 logvar)
 
-    def encode(self, observations, **kwargs):
-        logits = self.encoder(observations) # [Batch, 35]
+    def encode(self, observations, hidden_states=None, masks=None, **kwargs):
+        # [New] RNN Processing
+        next_hidden_states = None
+        if self.rnn is not None:
+             # Memory module logic:
+             # If hidden_states is NOT None -> Batch Mode. Expects Sequence input (L, N, H).
+             # If hidden_states IS None -> Inference Mode. Handles unsqueeze internally (1, N, H).
+             
+             if hidden_states is not None:
+                 # Check if observations is 2D (N, H) -> Unsqueeze to (1, N, H)
+                 if observations.dim() == 2:
+                     rnn_input = observations.unsqueeze(0)
+                     rnn_out = self.rnn(rnn_input, masks, hidden_states)
+                     # rnn_out will be (1, N, H) (or L, N, H)
+                     if rnn_out.dim() == 3:
+                         rnn_out = rnn_out.squeeze(0)
+                 else:
+                     # Already 3D or more? Just pass through
+                     rnn_out = self.rnn(observations, masks, hidden_states)
+             else:
+                 # Inference mode handles unsqueeze internally
+                 rnn_out = self.rnn(observations, masks, hidden_states)
+             
+             logits = self.encoder(rnn_out)
+        else:
+             logits = self.encoder(observations) # [Batch, 35]
         
         # 切片逻辑
         # 1. v_mean: 前 3 维
@@ -116,9 +158,35 @@ class CENet(nn.Module):
 
     def encoder_inference(self, observations):
         """推理模式：只返回确定性的均值"""
+        if self.rnn is not None:
+             pass
         logits = self.encoder(observations) # [Batch, 35]
         
         # 提取 v_mean
         v_mean = logits[:, :self.latent_dim]
         
         return v_mean
+    
+    # [新增] 显式支持 state 的 inference 接口
+    def encoder_inference_recurrent(self, observations, hidden_states=None):
+        if self.rnn is not None:
+             # Manually handle RNN to get next_hidden_states
+             # observations: (N, Dim)
+             rnn_input = observations
+             if rnn_input.dim() == 2:
+                  rnn_input = rnn_input.unsqueeze(0) # (1, N, Dim)
+             
+             # Call underlying RNN directly: self.rnn is Memory, self.rnn.rnn is GRU/LSTM
+             rnn_out, next_hidden_states = self.rnn.rnn(rnn_input, hidden_states)
+             
+             # Squeeze output back for MLP
+             rnn_out = rnn_out.squeeze(0)
+             
+             # rnn_out: (N, Hidden)
+             observations = rnn_out
+        else:
+             next_hidden_states = None
+             
+        logits = self.encoder(observations)
+        v_mean = logits[:, :self.latent_dim]
+        return v_mean, next_hidden_states

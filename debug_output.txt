@@ -1,0 +1,35 @@
+Testing Legacy CENet (No RNN)...
+Legacy Encode OK
+Testing Recurrent CENet (GRU)...
+Recurrent Encode (Inference Mode / No Hidden) OK
+DEBUG: obs shape=torch.Size([5, 64]), dim=2
+DEBUG: hidden shape=torch.Size([1, 5, 128])
+DEBUG: unsqueezed rnn_input shape=torch.Size([1, 5, 64])
+Recurrent Encode (Batch Mode / With Hidden) OK
+Traceback (most recent call last):
+  File "/home/pke/code/rl-isaac-sim/instinct_rl/tests/test_recurrent_cenet.py", line 65, in <module>
+    test_recurrent_cenet()
+  File "/home/pke/code/rl-isaac-sim/instinct_rl/tests/test_recurrent_cenet.py", line 58, in test_recurrent_cenet
+    v_mean, next_hidden = cenet.encoder_inference_recurrent(obs, hidden_states)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pke/code/rl-isaac-sim/instinct_rl/instinct_rl/modules/cenet.py", line 197, in encoder_inference_recurrent
+    observations, next_hidden_states = self.rnn(observations, hidden_states=hidden_states)
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pke/miniconda3/envs/isaaclab/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pke/miniconda3/envs/isaaclab/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pke/code/rl-isaac-sim/instinct_rl/instinct_rl/modules/actor_critic_recurrent.py", line 162, in forward
+    out, _ = self.rnn(input, hidden_states)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pke/miniconda3/envs/isaaclab/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pke/miniconda3/envs/isaaclab/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pke/miniconda3/envs/isaaclab/lib/python3.11/site-packages/torch/nn/modules/rnn.py", line 1365, in forward
+    raise RuntimeError(
+RuntimeError: For unbatched 2-D input, hx should also be 2-D but got 3-D tensor

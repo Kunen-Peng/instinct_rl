@@ -35,7 +35,7 @@ from .him_ppo import HIMPPO
 from .tppo import TPPO
 from .vae_distill import VaeDistill
 from .wasabi import WasabiAlgoMixin, WasabiPPO
-from .dreamwaq import PPODreamWaQ
+from .dreamwaq import PPODreamWaQ, PPODreamWaQRecurrent
 from .np3o import NP3O
 
 
@@ -60,5 +60,6 @@ __all__ = [
     "WasabiPPO",
     "WasabiEstimatorPPO",
     "PPODreamWaQ",
+    "PPODreamWaQRecurrent",
     "NP3O",
 ]
