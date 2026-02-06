@@ -243,10 +243,10 @@ class DreamWaQRunner(OnPolicyRunner):
             verbose=True,
             input_names=["obs"],
             output_names=["actions"],
-            dynamic_axes={
-                "obs": {0: "batch"},
-                "actions": {0: "batch"}
-            },
-            opset_version=11
+            # dynamic_axes={
+            #     "obs": {0: "batch"},
+            #     "actions": {0: "batch"}
+            # },
+            opset_version=12
         )
         print(f"DreamWaQ Policy exported to {export_path}")
