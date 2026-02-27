@@ -164,6 +164,27 @@ class NP3O(PPO):
         # Call parent's process_env_step (handles rewards, values, storage)
         super().process_env_step(rewards, dones, infos, next_obs, next_critic_obs, next_critic_obs_for_bootstrap)
 
+    def compute_returns(self, last_critic_obs):
+        """
+        Compute reward returns and advantages globally.
+        Overrides parent to ensure reward advantages are strictly normalized 
+        globally per dimension before the minibatch generator is called, exactly like costs.
+        """
+        super().compute_returns(last_critic_obs)
+        
+        # PPO's RolloutStorage does a global scalar normalization.
+        # Here we explicitly enforce per-dimension global normalization 
+        # (in case num_rewards > 1) just like RolloutStorageWithCost does for costs,
+        # ensuring reward advantages have exact N(0,1) global scale.
+        adv = self.storage.advantages
+        num_transitions, num_envs, num_rewards = adv.shape
+        adv_flat = adv.view(-1, num_rewards)
+        
+        # Re-normalize globally per reward dimension
+        adv_mean = adv_flat.mean(dim=0).view(1, 1, -1)
+        adv_std = adv_flat.std(dim=0).view(1, 1, -1)
+        self.storage.advantages = (adv - adv_mean) / (adv_std + 1e-8)
+
     def compute_cost_returns(self, last_critic_obs):
         """
         Compute cost returns and advantages using GAE.

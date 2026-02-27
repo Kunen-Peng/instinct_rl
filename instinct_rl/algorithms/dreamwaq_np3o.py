@@ -132,6 +132,13 @@ class DreamWaQNP3O(NP3O):
         """
         Initialize rollout storage with both cost and DreamWaQ tracking.
         """
+        # Cache observation segment definitions from the environment.
+        # NOTE: For recurrent actor-critic, actor_critic.{obs_segments,critic_obs_segments} describe
+        # the *RNN head* inputs (e.g. memory_latent) rather than raw env observations.
+        # We must use env-provided segments when slicing raw obs tensors.
+        self._policy_obs_segments = obs_format["policy"]
+        self._critic_obs_segments = obs_format.get("critic", obs_format["policy"])
+
         obs_size = get_subobs_size(obs_format["policy"])
         critic_obs_size = get_subobs_size(obs_format.get("critic")) if "critic" in obs_format else None
         
@@ -177,9 +184,9 @@ class DreamWaQNP3O(NP3O):
             # Note: This assumes ActorCritic knows how to handle segments
             # We need to construct the estimate manually: [lin_vel (3), zeros(latent)]
             lin_vel = get_subobs_by_components(
-                critic_obs, 
-                ["base_lin_vel"], 
-                self.actor_critic.critic_obs_segments
+                critic_obs,
+                ["base_lin_vel"],
+                self._critic_obs_segments,
             )
             # estimate is [batch, 19] typically (3 vel + 16 latent)
             # We take the latent part size from cenet config or infer from estimate shape

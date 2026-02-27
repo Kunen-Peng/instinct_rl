@@ -4,6 +4,7 @@ from typing import Dict
 from .actor_critic import ActorCritic
 from .actor_critic_with_cost import ActorCriticWithCost
 from .actor_critic_recurrent import ActorCriticRecurrent
+from .actor_critic_recurrent_with_cost import ActorCriticRecurrentWithCost
 from .all_mixer import (
     EncoderMoEActorCritic,
     EncoderStateAc,
