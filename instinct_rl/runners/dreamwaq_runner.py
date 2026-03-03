@@ -13,11 +13,7 @@ class DreamWaQRunner(OnPolicyRunner):
         self.env = env
 
         # CENet Init
-        # Try to get from Env (priority), then Config
         num_single_obs = getattr(self.env, "num_single_obs", self.cfg.get("num_single_obs"))
-        
-        # Default num_encoder_obs to env.num_obs (assuming full obs is input to encoder)
-        # This handles cases where num_encoder_obs is not explicitly config'd but implies full observation space
         num_encoder_obs = getattr(self.env, "num_encoder_obs", self.cfg.get("num_encoder_obs", self.env.num_obs))
         
         if num_single_obs is None:
@@ -29,11 +25,8 @@ class DreamWaQRunner(OnPolicyRunner):
         self.cenet = CENet(num_encoder_obs, num_single_obs).to(self.device)
         
         # Update obs_format to include estimator output
-        # CENet output dim is est_z + est_v + est_h (default 16 + 3 + 0 = 19)
-        # We can get it from self.cenet.encoder.model[-1].out_features if available or hardcode based on defaults
         est_dim = self.cenet.latent_dim
         obs_format = env.get_obs_format()
-        # Create a copy to avoid mutating original env property if reference (though get_obs_format usually returns new dict)
         obs_format["policy"]["estimator"] = (est_dim,)
 
         import instinct_rl.modules as modules
@@ -117,6 +110,18 @@ class DreamWaQRunner(OnPolicyRunner):
             else:
                 if obs_group_name in infos["observations"]:
                     infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
+                    
+        # Apply normalization to termination_observations to avoid outlier explosion in loss
+        if "termination_observations" in infos:
+            term_obs = infos["termination_observations"]
+            if isinstance(term_obs, dict):
+                for k, v in term_obs.items():
+                    if k in self.normalizers:
+                        term_obs[k] = self.normalizers[k](v)
+            else:
+                # If term_obs is a direct tensor and normalizers have 'critic', assuming we are predicting critic
+                if "critic" in self.normalizers:
+                    infos["termination_observations"] = self.normalizers["critic"](term_obs)
         
         # Rewards No Clip
         # DWL uses a separate buffer. We'll use the returned rewards or info['rewards_noClip'] if available.
@@ -129,22 +134,10 @@ class DreamWaQRunner(OnPolicyRunner):
         
         return next_obs, next_critic_obs, rewards, dones, infos
 
-    # Important: Need to support saving/loading CENet state
     def save(self, path, infos=None):
         run_state_dict = self.alg.state_dict()
+        
         # Add CENet state
-        # PPODreamWaQ does NOT hold CENet state in its state_dict by default PPO logic?
-        # PPO state_dict only saves actor_critic and optimizer.
-        # We need to ensure PPODreamWaQ saves CENet or We save it here.
-        # PPODreamWaQ has optimizer_cenet.
-        
-        # Let's check PPODreamWaQ implementation in instinct_rl/algorithms/dreamwaq.py
-        # Current implementation inherits PPO state_dict which is: 
-        # {"model_state_dict": ..., "optimizer_state_dict": ...}
-        # It does NOT save cenet. 
-        # We should modify PPODreamWaQ to override state_dict OR handle it in Runner.
-        # Runner handle is easier if we don't want to touch algo more.
-        
         run_state_dict["cenet_state_dict"] = self.cenet.state_dict()
         run_state_dict["optimizer_cenet_state_dict"] = self.alg.optimizer_cenet.state_dict()
         
@@ -183,7 +176,6 @@ class DreamWaQRunner(OnPolicyRunner):
                 obs_norm = obs
             
             # 2. CENet Encoder (Use mean)
-            # encoder_inference usually returns the mean
             latent = self.cenet.encoder_inference(obs_norm)
             
             # 3. Concat (Augment observation)
@@ -217,10 +209,7 @@ class DreamWaQRunner(OnPolicyRunner):
                 if self.normalizer is not None:
                     obs = self.normalizer(obs)
                 
-                # 2. CENet Encoder (Inference uses mean)
-                # Note: cenet.encoder_inference already returns v_mean (dim depends on latent_dim)
-                # We need to make sure we are calling the right method or logic. 
-                # Checking cenet.py: encoder_inference returns v_mean corresponding to self.latent_dim
+                # 2. CENet Encoder
                 latent = self.cenet.encoder_inference(obs)
                 
                 # 3. Concat (Augment observation)
@@ -257,13 +246,6 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
     Manages CENet hidden states during rollout and inference.
     """
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
-        # We need to initialize carefully because Parent __init__ creates CENet without RNN args by default
-        # unless we pass them or they come from config?
-        # DreamWaQRunner.__init__ calls CENet(num_encoder_obs, num_single_obs)
-        # It does NOT pass kwargs to CENet!
-        # So we MUST override __init__ to pass RNN args to CENet.
-        
-        # Copied structure from DreamWaQRunner but with fixes for Recurrent CENet
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
@@ -390,11 +372,6 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
         # pass current cenet_hidden_states
         actions, next_cenet_hidden_states = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
         
-        # Update state for next step
-        # Note: we update self.cenet_hidden_states AFTER stepping environment to handle dones?
-        # NO, usually we use the state resulting from current step as input to next step.
-        # BUT, if done, we must reset state.
-        
         self.cenet_hidden_states = next_cenet_hidden_states.detach()
 
         # Step Env
@@ -427,6 +404,18 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
             else:
                 if obs_group_name in infos["observations"]:
                     infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
+                    
+        # Apply normalization to termination_observations to avoid outlier explosion in loss
+        if "termination_observations" in infos:
+            term_obs = infos["termination_observations"]
+            if isinstance(term_obs, dict):
+                for k, v in term_obs.items():
+                    if k in self.normalizers:
+                        term_obs[k] = self.normalizers[k](v)
+            else:
+                # If term_obs is a direct tensor and normalizers have 'critic', assuming we are predicting critic
+                if "critic" in self.normalizers:
+                    infos["termination_observations"] = self.normalizers["critic"](term_obs)
         
         rewards_noClip = infos.get("rewards_noClip", rewards) 
         if isinstance(rewards_noClip, torch.Tensor):
@@ -442,17 +431,12 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
             self.alg.actor_critic.to(device)
             self.cenet.to(device)
             if self.cenet.rnn is not None:
-                 # Need to re-init states on new device if changed? 
-                 # Inference policy usually assumes new session or requires manual reset.
-                 # We will use closure to hold state.
                  pass
 
         if "policy" in self.normalizers:
             self.normalizers["policy"].to(device)
             
         # Closure state
-        # Initial hidden state (all zeros) assumption
-        # We need to know batch size? usually inferred from first call.
         
         class StatefulPolicy:
             def __init__(self, runner, device):
@@ -486,10 +470,6 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
                 
                 # Actor Inference
                 obs_aug = torch.cat((obs_norm, v_mean), dim=-1)
-                
-                # Handle Actor Recurrent State (if actor itself is recurrent)
-                # DreamWaQRunner usually wraps act_inference which handles internal state?
-                # Base ActorCriticRecurrent.act_inference uses internal self.memory.hidden_states.
                 
                 return self.runner.alg.actor_critic.act_inference(obs_aug)
                 

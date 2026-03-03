@@ -49,8 +49,7 @@ class RolloutStorageDreamWaQWithCost(RolloutStorageWithCost):
     def get_minibatch_from_selection(self, T_select, B_select, padded_B_slice=None, prev_done_mask=None):
         minibatch = super().get_minibatch_from_selection(T_select, B_select, padded_B_slice, prev_done_mask)
 
-        # Handle single_obs (currently assuming MLP/non-recurrent for estimator part essentially)
-        # Note: If CENet becomes recurrent, this needs more logic similar to hidden states
+        # Handle single_obs
         if padded_B_slice is None:
             single_obs_batch = self.single_obs[T_select, B_select]
         else:
@@ -133,9 +132,6 @@ class DreamWaQNP3O(NP3O):
         Initialize rollout storage with both cost and DreamWaQ tracking.
         """
         # Cache observation segment definitions from the environment.
-        # NOTE: For recurrent actor-critic, actor_critic.{obs_segments,critic_obs_segments} describe
-        # the *RNN head* inputs (e.g. memory_latent) rather than raw env observations.
-        # We must use env-provided segments when slicing raw obs tensors.
         self._policy_obs_segments = obs_format["policy"]
         self._critic_obs_segments = obs_format.get("critic", obs_format["policy"])
 
@@ -180,30 +176,18 @@ class DreamWaQNP3O(NP3O):
         if self.use_estimate:
             final_estimate = estimate
         else:
-            # If not using estimate, use ground truth for velocity (cheating) + zero latent
-            # Note: This assumes ActorCritic knows how to handle segments
-            # We need to construct the estimate manually: [lin_vel (3), zeros(latent)]
             lin_vel = get_subobs_by_components(
                 critic_obs,
                 ["base_lin_vel"],
                 self._critic_obs_segments,
             )
-            # estimate is [batch, 19] typically (3 vel + 16 latent)
-            # We take the latent part size from cenet config or infer from estimate shape
-            latent_size = estimate.shape[-1] - 3 
-            z_part = estimate[:, 3:] # Use learned latent or zeros? DreamWaQ uses learned latent part
-            
-            # Reconstruct: GT Vel + Latent
+            z_part = estimate[:, 3:]
             final_estimate = torch.cat([lin_vel.detach(), z_part], dim=-1)
             
         # 3. Augment observation
         obs_augmented = torch.cat((obs, final_estimate), dim=-1)
         
         # --- Standard PPO/NP3O Act Logic ---
-        # Note: We call actor_critic.act with augmented obs
-        
-        # We process recurrent states manually if needed, but actor_critic.act handles it usually
-        # However, we need to populate self.transition fields correctly
         
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
@@ -212,8 +196,6 @@ class DreamWaQNP3O(NP3O):
         self.transition.actions = self.actor_critic.act(obs_augmented).detach()
         
         # Value evaluation (Reward Critic)
-        # Use critic_obs if available, else augmented obs (?) 
-        # Usually critic uses privileged info directly.
         val_input = critic_obs if critic_obs is not None else obs_augmented
         self.transition.values = self.actor_critic.evaluate(val_input).detach()
         
@@ -276,19 +258,12 @@ class DreamWaQNP3O(NP3O):
                 
                 # Reward Value Bootstrap
                 bootstrap_values = self.actor_critic.evaluate(bootstrap_obs).detach()
-                # Assuming rewards (vectorized) + gamma * ...
-                # Note: NP3O's parent (PPO) process_env_step calls super().process_env_step
-                # We need to manually handle reward bootstrap since we are overriding
-        
-        # Standard PPO process (rewards, values, dones) - partially handled by parent call in NP3O
-        # But we need to pass extra args to NP3O.process_env_step which calls PPO.process_env_step...
-        # BUT NP3O's process_env_step signature is fixed. 
-        # We are overriding it here completely to mix logic.
+                # Reward Value Bootstrap (Manual implementation due to override)
         
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         
-        # Reward Value Bootstrap (Manual implementation to ensure correctness with mixed logic)
+        # Reward Value Bootstrap
         if 'time_outs' in infos and bootstrap_obs is not None:
              with torch.no_grad():
                 bootstrap_values = self.actor_critic.evaluate(bootstrap_obs).detach()
@@ -356,8 +331,6 @@ class DreamWaQNP3O(NP3O):
         mean_loss_est = torch.tensor(0.0, device=self.device)
         
         for minibatch_data in generator:
-            # Unpack (RolloutStorageDreamWaQWithCost.MiniBatch)
-            # fields: [obs, critic_obs, actions, ... , single_obs]
             minibatch = minibatch_data[0]
             target_cost_values_batch = minibatch_data[1]
             cost_advantages_batch = minibatch_data[2]
@@ -425,8 +398,6 @@ class DreamWaQNP3O(NP3O):
             # --- Step B: CENet (Estimator) Update ---
             
             # B1. Get Ground Truth Velocity
-            # Requires critic_obs_segments to be available in actor_critic or passed somehow
-            # DreamWaQ assumes actor_critic has it.
             lin_vel = get_subobs_by_components(
                 minibatch.critic_obs, 
                 ["base_lin_vel"], 
@@ -434,8 +405,6 @@ class DreamWaQNP3O(NP3O):
             )
             
             # B2. Strip Estimate from Obs to get Raw Obs
-            # obs is [raw | estimate]. CENet takes raw.
-            # raw input dim is in self.cenet.encoder.model[0].in_features
             raw_obs_dim = self.cenet.encoder.model[0].in_features
             raw_obs = minibatch.obs[..., :raw_obs_dim]
             
@@ -445,12 +414,12 @@ class DreamWaQNP3O(NP3O):
             est_logvar = self.cenet.encoder_logvar
             
             # B4. KL Loss
-            # est_logvar is 2*log_std = log(var)
             kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar - est_mean[:,-16:] ** 2 - torch.exp(est_logvar), dim=1))
             
+            mask = 1.0 - minibatch.dones
             # B5. Functional Losses (Velocity Tracking + Observation Recruitment)
-            loss_vt = F.mse_loss(est_mean[:,:3], lin_vel)
-            loss_ot = F.mse_loss(self.cenet.decode(z_sample), single_obs_batch)
+            loss_vt = F.mse_loss(est_mean[:,:3] * mask, lin_vel * mask)
+            loss_ot = F.mse_loss(self.cenet.decode(z_sample) * mask, single_obs_batch * mask)
             
             cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
             

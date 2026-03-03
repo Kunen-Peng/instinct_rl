@@ -13,9 +13,6 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
     Combines logic from OnConstraintPolicyRunner (costs) and DreamWaQRunner (estimator).
     """
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
-        # We perform valid initialization first before calling super/setup to ensure
-        # we can inject the correct algorithm setup logic.
-        
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
@@ -23,7 +20,6 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         self.env = env
         
         # --- DreamWaQ Setup (CENet) ---
-        # Try to get from Env (priority), then Config
         num_single_obs = getattr(self.env, "num_single_obs", self.cfg.get("num_single_obs"))
         num_encoder_obs = getattr(self.env, "num_encoder_obs", self.cfg.get("num_encoder_obs", self.env.num_obs))
         
@@ -39,10 +35,7 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         obs_format = env.get_obs_format()
         
         # Inject estimator dimension into obs_format for ActorCritic
-        # CENet output dim is latent_dim (v+z+h)
         est_dim = self.cenet.latent_dim
-        # Warning: ensure we are modifying a copy or updating correctly
-        # Usually get_obs_format returns a new dict, but to be safe:
         if "policy" not in obs_format: obs_format["policy"] = {}
         obs_format["policy"]["estimator"] = (est_dim,)
         
@@ -63,7 +56,6 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         ).to(self.device)
         
         # Initialize DreamWaQNP3O Algorithm
-        # We skip dynamic import since we know the class
         alg_class = dreamwaq_np3o_alg.DreamWaQNP3O
         
         # Check for k_value in env if needed
@@ -84,9 +76,6 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         self.normalizers = {}
         for obs_group_name, config in self.cfg.get("normalizers", dict()).items():
             config = config.copy()
-            # Careful: if we are normalizing policy obs, the input shape might need check
-            # Usually normalizer is applied on raw env obs BEFORE augmentation or split
-            # For DreamWaQ, 'policy' obs from env is huge (history), we normalize that.
             normalizer = modules.build_normalizer(
                 input_shape=get_subobs_size(obs_format[obs_group_name]) - est_dim if obs_group_name=="policy" else get_subobs_size(obs_format[obs_group_name]),
                 normalizer_class_name=config.pop("class_name"),
@@ -115,12 +104,12 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         self.current_learning_iteration = 0
         self.log_interval = self.cfg.get("log_interval", 1)
         self.git_status_repos = []
-        self._cost_buffer = [] # or deque in parent, we init fresh
+        self._cost_buffer = []
 
         # Initial Reset
         _, _ = self.env.reset()
 
-        # Cost tracking (re-init properly since we didn't call super().__init__)
+        # Cost tracking
         from collections import deque
         self._cost_buffer = deque(maxlen=100)
 
@@ -134,7 +123,6 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         5. Data processing (passing costs AND DreamWaQ extras).
         """
         # 1. & 2. Act
-        # Note: alg.act expects 'obs' to be the raw policy input (without estimator)
         actions = self.alg.act(obs, critic_obs)
         
         # Step
@@ -165,6 +153,17 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
                 infos["observations"][obs_group_name] = normalizer(
                     infos["observations"][obs_group_name]
                 )
+
+        # Apply normalization to termination_observations to avoid outlier explosion in loss
+        if "termination_observations" in infos:
+            term_obs = infos["termination_observations"]
+            if isinstance(term_obs, dict):
+                for k, v in term_obs.items():
+                    if k in self.normalizers:
+                        term_obs[k] = self.normalizers[k](v)
+            else:
+                if "critic" in self.normalizers:
+                    infos["termination_observations"] = self.normalizers["critic"](term_obs)
 
         # 5. Process Step
         # Get DreamWaQ specific extras
