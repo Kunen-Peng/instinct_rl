@@ -21,6 +21,7 @@ class RolloutStorageDreamWaQ(RolloutStorage):
         [
             *RolloutStorage.MiniBatch._fields,
             "single_obs",
+            "dones",
         ],
     )
 
@@ -42,10 +43,12 @@ class RolloutStorageDreamWaQ(RolloutStorage):
         
         if padded_B_slice is None:
             single_obs_batch = self.single_obs[T_select, B_select]
+            dones_batch = self.dones[T_select, B_select].float()
         else:
             single_obs_batch = self.single_obs[T_select, B_select]
+            dones_batch = self.dones[T_select, B_select].float()
 
-        return RolloutStorageDreamWaQ.MiniBatch(*minibatch, single_obs_batch)
+        return RolloutStorageDreamWaQ.MiniBatch(*minibatch, single_obs_batch, dones_batch)
 
 
 class PPODreamWaQ(PPO):
