@@ -407,7 +407,7 @@ class DreamWaQNP3O(NP3O):
             )
             
             # B2. Strip Estimate from Obs to get Raw Obs
-            raw_obs_dim = self.cenet.encoder.model[0].in_features
+            raw_obs_dim = self.cenet.raw_encoder_input_dim
             raw_obs = minibatch.obs[..., :raw_obs_dim]
             mask = 1.0 - minibatch.dones
             

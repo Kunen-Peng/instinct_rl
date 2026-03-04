@@ -223,7 +223,7 @@ class PPODreamWaQ(PPO):
             lin_vel = get_subobs_by_components(minibatch.critic_obs, ["base_lin_vel"], 
                                                 self.actor_critic.critic_obs_segments)
             
-            raw_obs = minibatch.obs[..., :self.cenet.encoder.model[0].in_features] 
+            raw_obs = minibatch.obs[..., :self.cenet.raw_encoder_input_dim]
             mask = 1.0 - minibatch.dones
             
             for _ in range(self.num_estimator_epochs):

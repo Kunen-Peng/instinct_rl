@@ -25,11 +25,33 @@ class DreamWaQRunner(OnPolicyRunner):
         elif "cenet" in self.cfg:
             cenet_cfg = self.cfg["cenet"]
 
+        if "num_history_steps" not in cenet_cfg:
+            if hasattr(self.env, "history_length"):
+                cenet_cfg["num_history_steps"] = self.env.history_length
+            elif hasattr(self.env.unwrapped, "history_length"):
+                cenet_cfg["num_history_steps"] = self.env.unwrapped.history_length
+
+        obs_format = env.get_obs_format()
+        if cenet_cfg.get("num_history_steps", 1) > 1 and "term_dims" not in cenet_cfg:
+            history_size = cenet_cfg["num_history_steps"]
+            inferred_term_dims = []
+            obs_segments = obs_format["policy"]
+            for term_name, term_shape in obs_segments.items():
+                if term_name == "estimator":
+                    continue
+                flat_dim = term_shape[0] if isinstance(term_shape, tuple) else term_shape
+                if flat_dim % history_size != 0:
+                     raise ValueError(f"Term '{term_name}' dim {flat_dim} not divisible by history_size {history_size}")
+                inferred_term_dims.append(flat_dim // history_size)
+            cenet_cfg["term_dims"] = inferred_term_dims
+            if "obs_layout" not in cenet_cfg:
+                cenet_cfg["obs_layout"] = "term_major"
+
         self.cenet = CENet(num_encoder_obs, num_single_obs, **cenet_cfg).to(self.device)
         
         # Update obs_format to include estimator output
         est_dim = self.cenet.latent_dim
-        obs_format = env.get_obs_format()
+        # obs_format = env.get_obs_format() # Already retrieved above
         obs_format["policy"]["estimator"] = (est_dim,)
 
         import instinct_rl.modules as modules
@@ -212,8 +234,31 @@ class DreamWaQRunner(OnPolicyRunner):
                 if self.normalizer is not None:
                     obs = self.normalizer(obs)
                 
-                # 2. CENet Encoder
-                latent = self.cenet.encoder_inference(obs)
+                # Check for term_major reshaping needed before inference
+                encoder = self.cenet.encoder
+                if hasattr(encoder, "obs_layout") and encoder.obs_layout == "term_major" and encoder.term_dims is not None:
+                    batch_size = obs.shape[0]
+                    history_length = encoder.num_history_steps
+                    
+                    term_histories = []
+                    offset = 0
+                    for dim in encoder.term_dims:
+                        chunk_size = dim * history_length
+                        # Slice the flattened history
+                        chunk = obs[:, offset:offset + chunk_size]
+                        # Reshape to [batch, history, dim]
+                        chunk = chunk.view(batch_size, history_length, dim)
+                        term_histories.append(chunk)
+                        offset += chunk_size
+                        
+                    # Concat along features
+                    time_major = torch.cat(term_histories, dim=-1)
+                    # Flatten back out to the input format MLPMixer expects initially
+                    obs_reshaped = time_major.view(batch_size, -1)
+                    latent = self.cenet.encoder_inference(obs_reshaped)
+                else:
+                    # 2. CENet Encoder
+                    latent = self.cenet.encoder_inference(obs)
                 
                 # 3. Concat (Augment observation)
                 obs_aug = torch.cat((obs, latent), dim=-1)
@@ -271,6 +316,28 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
             cenet_cfg = self.alg_cfg.pop("cenet") # Remove to avoid collision in alg init
         elif "cenet" in self.cfg:
             cenet_cfg = self.cfg["cenet"]
+
+        if "num_history_steps" not in cenet_cfg:
+            if hasattr(self.env, "history_length"):
+                cenet_cfg["num_history_steps"] = self.env.history_length
+            elif hasattr(self.env.unwrapped, "history_length"):
+                cenet_cfg["num_history_steps"] = self.env.unwrapped.history_length
+
+        obs_format = env.get_obs_format()
+        if cenet_cfg.get("num_history_steps", 1) > 1 and "term_dims" not in cenet_cfg:
+            history_size = cenet_cfg["num_history_steps"]
+            inferred_term_dims = []
+            obs_segments = obs_format["policy"]
+            for term_name, term_shape in obs_segments.items():
+                if term_name == "estimator":
+                    continue
+                flat_dim = term_shape[0] if isinstance(term_shape, tuple) else term_shape
+                if flat_dim % history_size != 0:
+                     raise ValueError(f"Term '{term_name}' dim {flat_dim} not divisible by history_size {history_size}")
+                inferred_term_dims.append(flat_dim // history_size)
+            cenet_cfg["term_dims"] = inferred_term_dims
+            if "obs_layout" not in cenet_cfg:
+                cenet_cfg["obs_layout"] = "term_major"
         
         self.cenet = CENet(
             num_encoder_obs, 
@@ -292,7 +359,7 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
 
         # Update obs_format
         est_dim = self.cenet.latent_dim
-        obs_format = env.get_obs_format()
+        # obs_format = env.get_obs_format() # Already retrieved above
         obs_format["policy"]["estimator"] = (est_dim,)
 
         import instinct_rl.modules as modules
@@ -517,11 +584,35 @@ class DreamWaQRecurrentRunner(DreamWaQRunner):
                 else:
                     obs_norm = obs
                 
-                # 2. CENet Recurrent Inference
-                # encoder_inference_recurrent returns (v_mean, next_hidden_states)
-                v_mean, next_cenet_hidden_states = self.cenet.encoder_inference_recurrent(obs_norm, cenet_hidden_states)
+                # Check for term_major reshaping needed before inference
+                encoder = self.cenet.encoder
+                if hasattr(encoder, "obs_layout") and encoder.obs_layout == "term_major" and encoder.term_dims is not None:
+                    batch_size = obs_norm.shape[0]
+                    history_length = encoder.num_history_steps
+                    
+                    term_histories = []
+                    offset = 0
+                    for dim in encoder.term_dims:
+                        chunk_size = dim * history_length
+                        # Slice the flattened history
+                        chunk = obs_norm[:, offset:offset + chunk_size]
+                        # Reshape to [batch, history, dim]
+                        chunk = chunk.view(batch_size, history_length, dim)
+                        term_histories.append(chunk)
+                        offset += chunk_size
+                        
+                    # Concat along features
+                    time_major = torch.cat(term_histories, dim=-1)
+                    # Flatten back out to the input format MLPMixer expects initially
+                    obs_reshaped = time_major.view(batch_size, -1)
+                    v_mean, next_cenet_hidden_states = self.cenet.encoder_inference_recurrent(obs_reshaped, cenet_hidden_states)
+                else:
+                    # 2. CENet Recurrent Inference
+                    # encoder_inference_recurrent returns (v_mean, next_hidden_states)
+                    v_mean, next_cenet_hidden_states = self.cenet.encoder_inference_recurrent(obs_norm, cenet_hidden_states)
                 
                 # 3. Concat (Augment observation)
+                # Ensure the original normalized obs is concatenated with the returned latent representation
                 obs_aug = torch.cat((obs_norm, v_mean), dim=-1)
                 
                 # 4. Actor Inference
