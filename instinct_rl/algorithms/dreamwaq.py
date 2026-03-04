@@ -67,6 +67,7 @@ class PPODreamWaQ(PPO):
                  desired_kl=0.01,
                  vae_beta=0.5,
                  use_Adaboot = True,
+                 num_estimator_epochs = 1, # Multiple gradient steps per minbatch for VAE akin to rsl_rl
                  device='cpu',
                  **kwargs):
         
@@ -78,6 +79,7 @@ class PPODreamWaQ(PPO):
         self.cenet.to(self.device)
         self.vae_beta = vae_beta
         self.use_Adaboot = use_Adaboot
+        self.num_estimator_epochs = num_estimator_epochs
         self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(5)]
         self.Pboot = torch.tensor(1.0, device=self.device)
         self.optimizer_cenet = optim.Adam(self.cenet.parameters(), lr=learning_rate)
@@ -219,37 +221,40 @@ class PPODreamWaQ(PPO):
                                                 self.actor_critic.critic_obs_segments)
             
             raw_obs = minibatch.obs[..., :self.cenet.encoder.model[0].in_features] 
-            
-            z_sample = self.cenet.encode(raw_obs)
-            est_mean = self.cenet.encoder_mean
-            est_logvar = self.cenet.encoder_logvar
-            
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar - est_mean[:,-16:] ** 2 - torch.exp(est_logvar), dim=1))            
-            
             mask = 1.0 - minibatch.dones
-            loss_vt = torch.nn.functional.mse_loss(est_mean[:,:3] * mask, lin_vel * mask)
-            loss_ot = torch.nn.functional.mse_loss(self.cenet.decode(z_sample) * mask, minibatch.single_obs * mask)
             
-            cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
-            
-            self.optimizer_cenet.zero_grad()
-            cenet_loss.backward()
-            nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
-            self.optimizer_cenet.step()
-            
-            mean_loss_vt += loss_vt
-            mean_loss_ot += loss_ot
-            mean_loss_kl += kl_loss
-            mean_loss_est += cenet_loss
+            for _ in range(self.num_estimator_epochs):
+                z_sample = self.cenet.encode(raw_obs)
+                est_mean = self.cenet.encoder_mean
+                est_logvar = self.cenet.encoder_logvar
+                
+                kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar - est_mean[:,-16:] ** 2 - torch.exp(est_logvar), dim=1))            
+                
+                loss_vt = torch.nn.functional.mse_loss(est_mean[:,:3] * mask, lin_vel * mask)
+                loss_ot = torch.nn.functional.mse_loss(self.cenet.decode(z_sample) * mask, minibatch.single_obs * mask)
+                
+                cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
+                
+                self.optimizer_cenet.zero_grad()
+                cenet_loss.backward()
+                nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
+                self.optimizer_cenet.step()
+                
+                mean_loss_vt += loss_vt
+                mean_loss_ot += loss_ot
+                mean_loss_kl += kl_loss
+                mean_loss_est += cenet_loss
                 
         num_updates = self.num_learning_epochs * self.num_mini_batches
+        est_updates = num_updates * self.num_estimator_epochs
+        
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         
-        mean_loss_vt /= num_updates
-        mean_loss_ot /= num_updates
-        mean_loss_kl /= num_updates
-        mean_loss_est /= num_updates
+        mean_loss_vt /= est_updates
+        mean_loss_ot /= est_updates
+        mean_loss_kl /= est_updates
+        mean_loss_est /= est_updates
         self.cenet_loss_list = [mean_loss_vt, mean_loss_ot, mean_loss_kl, mean_loss_est, self.Pboot]
             
         self.storage.clear()

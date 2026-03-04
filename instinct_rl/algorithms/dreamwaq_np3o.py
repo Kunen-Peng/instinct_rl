@@ -84,6 +84,7 @@ class DreamWaQNP3O(NP3O):
         num_learning_epochs=1,
         num_mini_batches=1,
         learning_rate=1e-3,
+        num_estimator_epochs=1,
         device='cpu',
         **kwargs
     ):
@@ -108,6 +109,7 @@ class DreamWaQNP3O(NP3O):
         self.cenet.to(self.device)
         self.vae_beta = vae_beta
         self.use_Adaboot = use_Adaboot
+        self.num_estimator_epochs = num_estimator_epochs
         
         self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(5)]
         self.Pboot = torch.tensor(1.0, device=self.device)
@@ -407,35 +409,37 @@ class DreamWaQNP3O(NP3O):
             # B2. Strip Estimate from Obs to get Raw Obs
             raw_obs_dim = self.cenet.encoder.model[0].in_features
             raw_obs = minibatch.obs[..., :raw_obs_dim]
-            
-            # B3. Forward CENet
-            z_sample = self.cenet.encode(raw_obs)
-            est_mean = self.cenet.encoder_mean
-            est_logvar = self.cenet.encoder_logvar
-            
-            # B4. KL Loss
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar - est_mean[:,-16:] ** 2 - torch.exp(est_logvar), dim=1))
-            
             mask = 1.0 - minibatch.dones
-            # B5. Functional Losses (Velocity Tracking + Observation Recruitment)
-            loss_vt = F.mse_loss(est_mean[:,:3] * mask, lin_vel * mask)
-            loss_ot = F.mse_loss(self.cenet.decode(z_sample) * mask, single_obs_batch * mask)
             
-            cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
-            
-            # B6. Gradient Step (CENet)
-            self.optimizer_cenet.zero_grad()
-            cenet_loss.backward()
-            nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
-            self.optimizer_cenet.step()
-            
-            mean_loss_vt += loss_vt.detach()
-            mean_loss_ot += loss_ot.detach()
-            mean_loss_kl += kl_loss.detach()
-            mean_loss_est += cenet_loss.detach()
+            for _ in range(self.num_estimator_epochs):
+                # B3. Forward CENet
+                z_sample = self.cenet.encode(raw_obs)
+                est_mean = self.cenet.encoder_mean
+                est_logvar = self.cenet.encoder_logvar
+                
+                # B4. KL Loss
+                kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar - est_mean[:,-16:] ** 2 - torch.exp(est_logvar), dim=1))
+                
+                # B5. Functional Losses (Velocity Tracking + Observation Recruitment)
+                loss_vt = F.mse_loss(est_mean[:,:3] * mask, lin_vel * mask)
+                loss_ot = F.mse_loss(self.cenet.decode(z_sample) * mask, single_obs_batch * mask)
+                
+                cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
+                
+                # B6. Gradient Step (CENet)
+                self.optimizer_cenet.zero_grad()
+                cenet_loss.backward()
+                nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
+                self.optimizer_cenet.step()
+                
+                mean_loss_vt += loss_vt.detach()
+                mean_loss_ot += loss_ot.detach()
+                mean_loss_kl += kl_loss.detach()
+                mean_loss_est += cenet_loss.detach()
 
         # --- Statistics & Cleanup ---
         num_updates = self.num_learning_epochs * self.num_mini_batches
+        est_updates = num_updates * self.num_estimator_epochs
         
         # Normalize losses
         for k in mean_losses:
@@ -443,10 +447,10 @@ class DreamWaQNP3O(NP3O):
         for k in average_stats:
             average_stats[k] /= num_updates
             
-        mean_loss_vt /= num_updates
-        mean_loss_ot /= num_updates
-        mean_loss_kl /= num_updates
-        mean_loss_est /= num_updates
+        mean_loss_vt /= est_updates
+        mean_loss_ot /= est_updates
+        mean_loss_kl /= est_updates
+        mean_loss_est /= est_updates
         
         self.cenet_loss_list = [mean_loss_vt, mean_loss_ot, mean_loss_kl, mean_loss_est, self.Pboot]
         

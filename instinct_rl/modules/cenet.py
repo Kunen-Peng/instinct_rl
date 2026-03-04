@@ -28,8 +28,8 @@ class CENet(nn.Module):
                  num_est_h=0, 
                  num_est_v=3, 
                  num_est_z=16,
-                 encoder_hidden_dim=[512, 256, 128],
-                 decoder_hidden_dim=[64, 48],
+                 encoder_hidden_dim=[256, 128],
+                 decoder_hidden_dim=[256, 128],
                  activation=nn.ELU(),
                  rnn_type=None, # [New]
                  rnn_hidden_size=256, # [New]

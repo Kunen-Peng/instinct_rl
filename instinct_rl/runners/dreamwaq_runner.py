@@ -18,11 +18,14 @@ class DreamWaQRunner(OnPolicyRunner):
         
         if num_single_obs is None:
              raise ValueError("DreamWaQRunner requires num_single_obs to be defined in Env or Runner Config")
-        
-        # Log to confirm resolution
-        print(f"[DreamWaQRunner] Initialized CENet with num_encoder_obs={num_encoder_obs}, num_single_obs={num_single_obs}")
+             
+        cenet_cfg = {}
+        if "cenet" in self.alg_cfg:
+            cenet_cfg = self.alg_cfg.pop("cenet")
+        elif "cenet" in self.cfg:
+            cenet_cfg = self.cfg["cenet"]
 
-        self.cenet = CENet(num_encoder_obs, num_single_obs).to(self.device)
+        self.cenet = CENet(num_encoder_obs, num_single_obs, **cenet_cfg).to(self.device)
         
         # Update obs_format to include estimator output
         est_dim = self.cenet.latent_dim
