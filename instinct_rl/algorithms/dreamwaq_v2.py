@@ -52,7 +52,7 @@ class RolloutStorageDreamWaQ(RolloutStorage):
         return RolloutStorageDreamWaQ.MiniBatch(*minibatch, single_obs_batch, dones_batch)
 
 
-class PPODreamWaQ(PPO):
+class PPODreamWaQV2(PPO):
     def __init__(self,
                  actor_critic,
                  cenet,
@@ -86,10 +86,10 @@ class PPODreamWaQ(PPO):
         self.num_estimator_epochs = num_estimator_epochs
         
         # Adaptive Beta specific
-        self.target_mse_ot = kwargs.pop('target_mse_ot', 0.05)
-        self.beta_delta = kwargs.pop('beta_delta', 1.0)
+        self.target_mse_ot = kwargs.pop('target_mse_ot', 0.15)  # Tau = 0.15
+        self.beta_delta = kwargs.pop('beta_delta', 1.0)         # Delta = 1.0
         self.min_vae_beta = kwargs.pop('min_vae_beta', 0.01)
-        self.max_vae_beta = kwargs.pop('max_vae_beta', 0.5)
+        self.max_vae_beta = kwargs.pop('max_vae_beta', 0.5)     # Max Beta = 0.5
         
         self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(5)]
         self.Pboot = torch.tensor(1.0, device=self.device)
@@ -330,7 +330,7 @@ class RolloutStorageDreamWaQRecurrent(RolloutStorageDreamWaQ):
         return RolloutStorageDreamWaQRecurrent.MiniBatch(*minibatch, cenet_hidden_states_batch)
 
 
-class PPODreamWaQRecurrent(PPODreamWaQ):
+class PPODreamWaQRecurrentV2(PPODreamWaQV2):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Override transition with the recurrent one
@@ -340,7 +340,7 @@ class PPODreamWaQRecurrent(PPODreamWaQ):
         if self.cenet.rnn is None:
              raise ValueError("PPODreamWaQRecurrent requires a recurrent CENet (rnn is None).")
              
-        cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.rnn.hidden_size)
+        cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.hidden_size)
         
         obs_size = 0
         for k, v in obs_format["policy"].items():
@@ -368,21 +368,42 @@ class PPODreamWaQRecurrent(PPODreamWaQ):
         )
 
     def act(self, obs, critic_obs, cenet_hidden_states=None):
-        rnn_out, next_cenet_hidden_states = self.cenet.rnn.rnn(obs.unsqueeze(0), cenet_hidden_states)
-        rnn_out = rnn_out.squeeze(0)
+        # We must route through the Pre-Embedding layer and decoupled heads in V2
+        # `encode` method handles all of this automatically
+        # Note: encode outputs `full_sampled`, but also stores next hidden states internally?
+        # No, `encode` in V2 doesn't return next hidden states explicitly. We need to handle it.
+        # Actually in `cenet_v2.py`, `encode` does: `if hidden_states is not None: rnn_out, _ = self.rnn(emb, hidden_states)`
+        # But it doesn't return the next hidden states. We must fix `encode` in `cenet_v2.py` or use `encoder_inference_recurrent` here.
         
-        logits = self.cenet.encoder(rnn_out)
+        # During act (rollout), we need sampled outputs (z_sampled) for SAC/PPO exploration, 
+        # but PPODreamWaQ only uses deterministic mean for the actor input (`final_estimate`), 
+        # so actually we just need the means, EXCEPT that `act` uses `full_sampled` to compute `final_estimate`.
+        # Let's align with the V2 `encode` method. Since `act` needs `next_cenet_hidden_states` out, 
+        # we will use `encoder_inference_recurrent(obs, cenet_hidden_states)` which returns (v_full_mean, next_states)
+        # Wait, the original DWQ code samples Z and adds it to the actor observation during rollout!
+        # Let's use `cenet.encode` and just fetch the hidden states manually... Wait, `cenet_v2.py` `encode` drops the next hidden state!
         
-        # Slicing
-        v_mean = logits[:, :self.cenet.dim_v]
-        z_params = logits[:, self.cenet.dim_v:]
-        z_mean, z_log_std = torch.chunk(z_params, 2, dim=-1)
+        # Let's perform the operations directly here to get both sampled Z AND next hidden states, 
+        # OR we can modify `cenet_v2.py` encode to return it. It's safer to reproduce the forward pass here:
+        if obs.dim() == 2:
+            rnn_input = obs.unsqueeze(1)
+        else:
+            rnn_input = obs
+            
+        emb = self.cenet.pre_embedding(rnn_input)
+        rnn_out, next_cenet_hidden_states = self.cenet.rnn(emb, cenet_hidden_states)
+        
+        last_features = rnn_out[:, -1, :]
+        
+        v_mean = self.cenet.v_head(last_features)
+        z_mean = self.cenet.z_mean_head(last_features)
+        z_log_std = self.cenet.z_logstd_head(last_features)
         
         z_log_std = torch.clamp(z_log_std, min=-5.0, max=2.0)
         z_std = torch.exp(z_log_std)
         z_sampled = Normal(z_mean, z_std).rsample()
-        full_sampled = torch.cat([v_mean, z_sampled], dim=-1)
         
+        full_sampled = torch.cat([v_mean, z_sampled], dim=-1)
         estimate = full_sampled.detach()
         
         if self.use_estimate:
@@ -445,8 +466,8 @@ class PPODreamWaQRecurrent(PPODreamWaQ):
                                                 self.actor_critic.critic_obs_segments)
             
             # Raw obs for CENet
-            # Use rnn input size because encoder input size is hidden size!
-            raw_obs_dim = self.cenet.rnn.rnn.input_size
+            # Use raw encoder input dimension to extract correct input before Pre-Embedding
+            raw_obs_dim = self.cenet.raw_encoder_input_dim
             raw_obs = minibatch.obs[..., :raw_obs_dim] 
             
             cenet_hidden_states = minibatch.cenet_hidden_states

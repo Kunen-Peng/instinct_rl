@@ -1,4 +1,5 @@
 
+import math
 from collections import namedtuple, defaultdict
 import torch
 import torch.nn as nn
@@ -110,6 +111,12 @@ class DreamWaQNP3O(NP3O):
         self.vae_beta = vae_beta
         self.use_Adaboot = use_Adaboot
         self.num_estimator_epochs = num_estimator_epochs
+        
+        # Adaptive Beta specific
+        self.target_mse_ot = kwargs.pop('target_mse_ot', 0.05)
+        self.beta_delta = kwargs.pop('beta_delta', 1.0)
+        self.min_vae_beta = kwargs.pop('min_vae_beta', 0.01)
+        self.max_vae_beta = kwargs.pop('max_vae_beta', 0.5)
         
         self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(5)]
         self.Pboot = torch.tensor(1.0, device=self.device)
@@ -409,7 +416,7 @@ class DreamWaQNP3O(NP3O):
             # B2. Strip Estimate from Obs to get Raw Obs
             raw_obs_dim = self.cenet.raw_encoder_input_dim
             raw_obs = minibatch.obs[..., :raw_obs_dim]
-            mask = 1.0 - minibatch.dones
+            valid = ~minibatch.dones.squeeze(-1).bool()  # (batch,) True for non-terminal
             
             for _ in range(self.num_estimator_epochs):
                 # B3. Forward CENet
@@ -417,12 +424,14 @@ class DreamWaQNP3O(NP3O):
                 est_mean = self.cenet.encoder_mean
                 est_logvar = self.cenet.encoder_logvar
                 
-                # B4. KL Loss
-                kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar - est_mean[:,-16:] ** 2 - torch.exp(est_logvar), dim=1))
+                # B4. KL Loss (only valid samples)
+                kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar[valid] - est_mean[valid, -16:] ** 2 - torch.exp(est_logvar[valid]), dim=1))
                 
-                # B5. Functional Losses (Velocity Tracking + Observation Recruitment)
-                loss_vt = F.mse_loss(est_mean[:,:3] * mask, lin_vel * mask)
-                loss_ot = F.mse_loss(self.cenet.decode(z_sample) * mask, single_obs_batch * mask)
+                # B5. Functional Losses (only valid samples)
+                loss_vt = F.mse_loss(est_mean[valid, :3], lin_vel[valid])
+                
+                est_obs = self.cenet.decode(z_sample)
+                loss_ot = F.mse_loss(est_obs[valid], single_obs_batch[valid])
                 
                 cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
                 
@@ -451,6 +460,10 @@ class DreamWaQNP3O(NP3O):
         mean_loss_ot /= est_updates
         mean_loss_kl /= est_updates
         mean_loss_est /= est_updates
+        
+        # --- Adaptive Beta Scheduling ---
+        k_beta = math.exp(self.beta_delta * (self.target_mse_ot - mean_loss_ot.item()))
+        self.vae_beta = max(self.min_vae_beta, min(self.max_vae_beta, self.vae_beta * k_beta))
         
         self.cenet_loss_list = [mean_loss_vt, mean_loss_ot, mean_loss_kl, mean_loss_est, self.Pboot]
         

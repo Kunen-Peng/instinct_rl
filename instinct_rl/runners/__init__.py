@@ -36,6 +36,7 @@ from .dreamwaq_runner import DreamWaQRunner
 from .on_constraint_policy_runner import OnConstraintPolicyRunner
 from .dreamwaq_np3o_runner import DreamWaQNP3ORunner
 from .dreamwaq_runner import DreamWaQRunner, DreamWaQRecurrentRunner
+from .dreamwaq_v2_runner import DreamWaQRunnerV2, DreamWaQRecurrentRunnerV2
 
 
 
