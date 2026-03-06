@@ -4,6 +4,7 @@ import torch
 from instinct_rl.runners.on_policy_runner import OnPolicyRunner
 from instinct_rl.modules.cenet_v2 import CENetV2 as CENet
 from instinct_rl.algorithms.dreamwaq_v2 import PPODreamWaQV2, PPODreamWaQRecurrentV2
+from instinct_rl.utils.utils import get_subobs_by_components
 
 class DreamWaQRunnerV2(OnPolicyRunner):
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
@@ -101,6 +102,26 @@ class DreamWaQRunnerV2(OnPolicyRunner):
         self.normalizers = {}
         # ... (Same as base, omitted for brevity, add if needed)
 
+    def _set_true_feet_height_in_infos(self, infos, next_critic_obs):
+        """Extract terrain-relative foot clearance from unnormalized critic observations."""
+        if next_critic_obs is None:
+            return
+
+        true_next_critic_obs = next_critic_obs.clone()
+        term_ids = infos.get("termination_env_ids", [])
+        if len(term_ids) > 0 and "termination_observations" in infos:
+            term_obs = infos["termination_observations"]
+            if isinstance(term_obs, dict):
+                if "critic" in term_obs:
+                    true_next_critic_obs[term_ids] = term_obs["critic"]
+            else:
+                true_next_critic_obs[term_ids] = term_obs
+
+        infos["true_feet_height"] = get_subobs_by_components(
+            true_next_critic_obs,
+            ["foot_height_scan"],
+            self.alg.actor_critic.critic_obs_segments,
+        ).detach()
 
     def rollout_step(self, obs, critic_obs):
         # We need to extract single_obs (last frame) from obs
@@ -122,6 +143,8 @@ class DreamWaQRunnerV2(OnPolicyRunner):
             rewards.to(self.device),
             dones.to(self.device),
         )
+
+        self._set_true_feet_height_in_infos(infos, next_critic_obs)
         
         # Apply Normalizers (Missing in previous implementation!)
         for obs_group_name, normalizer in self.normalizers.items():
@@ -460,6 +483,8 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
             rewards.to(self.device),
             dones.to(self.device),
         )
+
+        self._set_true_feet_height_in_infos(infos, next_critic_obs)
         
         # Normalizers
         for obs_group_name, normalizer in self.normalizers.items():
@@ -642,4 +667,3 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
             opset_version=12
         )
         print(f"DreamWaQ Recurrent Policy exported to {export_path}")
-
