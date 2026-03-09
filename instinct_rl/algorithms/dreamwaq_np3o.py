@@ -78,7 +78,8 @@ class DreamWaQNP3O(NP3O):
         k_value_max=1.0,
         k_value_growth_rate=1.0004,
         k_warmup_iterations=100,
-        adaptive_alpha=0.02,
+        adaptive_beta=None,
+        adaptive_alpha=None,
         cost_value_loss_coef=1.0,
         cost_viol_loss_coef=1.0,
         # PPO/Common args
@@ -95,6 +96,7 @@ class DreamWaQNP3O(NP3O):
             k_value_max=k_value_max,
             k_value_growth_rate=k_value_growth_rate,
             k_warmup_iterations=k_warmup_iterations,
+            adaptive_beta=adaptive_beta,
             adaptive_alpha=adaptive_alpha,
             cost_value_loss_coef=cost_value_loss_coef,
             cost_viol_loss_coef=cost_viol_loss_coef,
@@ -150,15 +152,7 @@ class DreamWaQNP3O(NP3O):
         if cost_shape is None:
             raise ValueError("cost_shape must be provided for DreamWaQNP3O")
         
-        # Initialize k_value tensor if needed
-        if not isinstance(self.k_value, torch.Tensor):
-            self.k_value = torch.tensor(
-                [self.k_value] * cost_shape[0] if isinstance(cost_shape, tuple) else [self.k_value],
-                dtype=torch.float32,
-                device=self.device
-            )
-        else:
-            self.k_value = self.k_value.to(self.device)
+        self.k_value = self._to_cost_tensor(self.k_value, cost_shape)
             
         self.storage = RolloutStorageDreamWaQWithCost(
             num_envs,
@@ -218,7 +212,7 @@ class DreamWaQNP3O(NP3O):
         
         # --- NP3O Logic: Cost Evaluation ---
         with torch.no_grad():
-            self.transition.cost_values = self.actor_critic.evaluate_cost(val_input).detach()
+            self.transition.cost_values = self._evaluate_cost(val_input).detach()
             
         return self.transition.actions
 
@@ -252,31 +246,18 @@ class DreamWaQNP3O(NP3O):
         self.transition.single_obs = true_next_critic_obs[:,:num_single_obs]
         self.transition.rewards_noClip = rewards_noClip.clone()
         
-        # --- NP3O Logic: Costs and Bootstrapping ---
         self.transition.costs = costs.clone()
-        
-        # Bootstrap Cost Values on Timeout
         bootstrap_obs = next_critic_obs_for_bootstrap if next_critic_obs_for_bootstrap is not None else next_critic_obs
-        
-        if 'time_outs' in infos and bootstrap_obs is not None:
-            time_outs = infos['time_outs'].to(self.device)
-            with torch.no_grad():
-                # Cost Bootstrap
-                bootstrap_cost_values = self.actor_critic.evaluate_cost(bootstrap_obs).detach()
-                self.transition.costs = self.transition.costs + self.gamma * bootstrap_cost_values * time_outs.unsqueeze(-1)
-                
-                # Reward Value Bootstrap
-                bootstrap_values = self.actor_critic.evaluate(bootstrap_obs).detach()
-                # Reward Value Bootstrap (Manual implementation due to override)
+        self.transition.costs = self._bootstrap_timeout_costs(self.transition.costs, infos, bootstrap_obs)
         
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         
         # Reward Value Bootstrap
         if 'time_outs' in infos and bootstrap_obs is not None:
-             with torch.no_grad():
+            with torch.no_grad():
                 bootstrap_values = self.actor_critic.evaluate(bootstrap_obs).detach()
-             self.transition.rewards += (
+            self.transition.rewards += (
                 self.gamma * bootstrap_values * infos["time_outs"].unsqueeze(1).to(self.device)
             )
 
@@ -323,15 +304,7 @@ class DreamWaQNP3O(NP3O):
         # 1. Compute Pboot
         self.use_estimate = self.compute_Pboot()
         
-        # Generator
-        if self.actor_critic.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
-        else:
-            generator = self.storage.mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
+        generator = self._get_batch_generator()
 
         # CENet Loss Trackers
         mean_loss_vt = torch.tensor(0.0, device=self.device)
@@ -347,39 +320,18 @@ class DreamWaQNP3O(NP3O):
             cost_violation_batch = minibatch_data[4]
             single_obs_batch = minibatch.single_obs
 
-            # --- Step A: NP3O (Actor-Critic) Update ---
-            
-            # A1. Standard PPO losses
             losses, _, stats = self.compute_losses(minibatch)
-            
-            # A2. Cost Critic Loss
-            critic_hidden_states = minibatch.hidden_states.critic if self.actor_critic.is_recurrent else None
-            cost_value_batch = self.actor_critic.evaluate_cost(
-                minibatch.critic_obs, 
-                masks=minibatch.masks, 
-                hidden_states=critic_hidden_states
+            cost_value_loss = self._compute_cost_value_loss(
+                minibatch,
+                target_cost_values_batch,
+                cost_returns_batch,
             )
-            
-            if self.use_clipped_value_loss:
-                cost_value_clipped = target_cost_values_batch + (
-                    cost_value_batch - target_cost_values_batch
-                ).clamp(-self.clip_param, self.clip_param)
-                cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
-                cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
-                cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
-            else:
-                cost_value_loss = (cost_returns_batch - cost_value_batch).pow(2).mean()
-
-            # A3. Violation Loss
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(minibatch.actions)
-            viol_loss = self.compute_viol(
-                actions_log_prob_batch, 
-                minibatch.old_actions_log_prob, 
-                cost_advantages_batch, 
-                cost_violation_batch
+            viol_loss = self._compute_penalty_loss(
+                minibatch,
+                cost_advantages_batch,
+                cost_violation_batch,
             )
 
-            # A4. Combine Policy/Critic Losses
             total_ac_loss = 0.0
             for k, v in losses.items():
                 coef = getattr(self, k + "_coef", 1.0)
@@ -399,10 +351,7 @@ class DreamWaQNP3O(NP3O):
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             
-            # Collect AC stats
-            for k, v in stats.items():
-                if k not in average_stats: average_stats[k] = 0.0
-                average_stats[k] += v.detach()
+            self._accumulate_stats(average_stats, stats)
 
             # --- Step B: CENet (Estimator) Update ---
             
@@ -450,11 +399,8 @@ class DreamWaQNP3O(NP3O):
         num_updates = self.num_learning_epochs * self.num_mini_batches
         est_updates = num_updates * self.num_estimator_epochs
         
-        # Normalize losses
-        for k in mean_losses:
-            mean_losses[k] /= num_updates
-        for k in average_stats:
-            average_stats[k] /= num_updates
+        self._average_accumulator(mean_losses, num_updates)
+        self._average_accumulator(average_stats, num_updates)
             
         mean_loss_vt /= est_updates
         mean_loss_ot /= est_updates

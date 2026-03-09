@@ -26,6 +26,8 @@ class RolloutStorageWithCost(RolloutStorage):
         self.cost_returns = torch.zeros(num_transitions_per_env, num_envs, *cost_shape, device=self.device)
         self.cost_advantages = torch.zeros(num_transitions_per_env, num_envs, *cost_shape, device=self.device)
         self.cost_violation = torch.zeros(num_transitions_per_env, num_envs, *cost_shape, device=self.device)
+        self.cost_adv_mean = torch.zeros(*cost_shape, device=self.device)
+        self.cost_adv_std = torch.ones(*cost_shape, device=self.device)
 
     def add_transitions(self, transition: Transition):
         if self.step >= self.num_transitions_per_env:
@@ -52,16 +54,24 @@ class RolloutStorageWithCost(RolloutStorage):
 
         # Compute and normalize the cost advantages
         self.cost_advantages = self.cost_returns - self.cost_values
-        cost_adv_mean = self.cost_advantages.view(self.num_envs*self.num_transitions_per_env, -1).mean(0)
-        cost_adv_std = self.cost_advantages.view(self.num_envs*self.num_transitions_per_env, -1).std(0)
+        self.cost_adv_mean = self.cost_advantages.view(self.num_envs*self.num_transitions_per_env, -1).mean(0)
+        self.cost_adv_std = self.cost_advantages.view(self.num_envs*self.num_transitions_per_env, -1).std(0)
         
         # Normalized cost related
-        self.cost_advantages = (self.cost_advantages - cost_adv_mean.view(1, 1, -1)) / (cost_adv_std.view(1, 1, -1) + 1e-8)
-        
-        # Cost violation
-        # ((1 - gamma) * (returns - limit) + advantage_mean) / advantage_std
-        # Use active thresholds for adaptive constraint scheduling
-        self.cost_violation = ((1. - gamma) * (self.cost_returns - self.active_cost_d_values) + cost_adv_mean.view(1, 1, -1)) / (cost_adv_std.view(1, 1, -1) + 1e-8)
+        self.cost_advantages = (self.cost_advantages - self.cost_adv_mean.view(1, 1, -1)) / (self.cost_adv_std.view(1, 1, -1) + 1e-8)
+        self.update_cost_violation(gamma)
+
+    def update_cost_violation(self, gamma):
+        """
+        Recompute normalized violation after active thresholds change.
+        """
+        if self.active_cost_d_values is None:
+            return
+
+        # Keep violation on the P3O return scale: (1 - gamma) * (J_C - d).
+        self.cost_violation = (
+            (1. - gamma) * (self.cost_returns - self.active_cost_d_values) + self.cost_adv_mean.view(1, 1, -1)
+        ) / (self.cost_adv_std.view(1, 1, -1) + 1e-8)
 
     def update_active_d_values(self, new_active_d):
         """

@@ -15,7 +15,6 @@ Key Components:
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
 
@@ -41,7 +40,8 @@ class NP3O(PPO):
         k_value_max=1.0,  # Maximum k_value cap
         k_value_growth_rate=1.0004,  # Growth rate per update
         k_warmup_iterations=100,  # κ stays at initial value during warmup
-        adaptive_alpha=0.02,  # Threshold relaxation factor for adaptive scheduling
+        adaptive_beta=None,  # Interpolation factor for adaptive threshold scheduling
+        adaptive_alpha=None,  # Backward-compatible alias for adaptive_beta
         cost_value_loss_coef=1.0,
         cost_viol_loss_coef=1.0,
         **kwargs
@@ -54,12 +54,88 @@ class NP3O(PPO):
         self.k_value_max = k_value_max
         self.k_value_growth_rate = k_value_growth_rate
         self.k_warmup_iterations = k_warmup_iterations
-        self.adaptive_alpha = adaptive_alpha
+        if adaptive_beta is None:
+            adaptive_beta = adaptive_alpha if adaptive_alpha is not None else 0.1
+        self.adaptive_beta = adaptive_beta
+        self.adaptive_alpha = adaptive_beta
         self.cost_value_loss_coef = cost_value_loss_coef
         self.cost_viol_loss_coef = cost_viol_loss_coef
         
         # Storage will be initialized in init_storage
         self.storage = None
+
+    def _get_cost_critic_input(self, obs, critic_obs):
+        return critic_obs if critic_obs is not None else obs
+
+    def _to_cost_tensor(self, value, cost_shape):
+        if isinstance(value, torch.Tensor):
+            return value.to(self.device)
+        repeat = cost_shape[0] if isinstance(cost_shape, tuple) else 1
+        return torch.tensor([value] * repeat, dtype=torch.float32, device=self.device)
+
+    def _evaluate_cost(self, critic_obs, **kwargs):
+        return self.actor_critic.evaluate_cost(critic_obs, **kwargs)
+
+    def _bootstrap_timeout_costs(self, costs, infos, bootstrap_obs):
+        if "time_outs" not in infos or bootstrap_obs is None:
+            return costs
+
+        time_outs = infos["time_outs"].to(self.device)
+        with torch.no_grad():
+            bootstrap_cost_values = self._evaluate_cost(bootstrap_obs).detach()
+        return costs + self.gamma * bootstrap_cost_values * time_outs.unsqueeze(-1)
+
+    def _normalize_reward_advantages(self):
+        adv = self.storage.advantages
+        num_rewards = adv.shape[-1]
+        adv_flat = adv.view(-1, num_rewards)
+        adv_mean = adv_flat.mean(dim=0).view(1, 1, -1)
+        adv_std = adv_flat.std(dim=0).view(1, 1, -1)
+        self.storage.advantages = (adv - adv_mean) / (adv_std + 1e-8)
+
+    def _get_batch_generator(self):
+        if self.actor_critic.is_recurrent:
+            return self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
+        return self.storage.mini_batch_generator(
+            self.num_mini_batches, self.num_learning_epochs
+        )
+
+    def _compute_cost_value_loss(self, minibatch, target_cost_values_batch, cost_returns_batch):
+        critic_hidden_states = minibatch.hidden_states.critic if self.actor_critic.is_recurrent else None
+        cost_value_batch = self._evaluate_cost(
+            minibatch.critic_obs,
+            masks=minibatch.masks,
+            hidden_states=critic_hidden_states,
+        )
+
+        if not self.use_clipped_value_loss:
+            return (cost_returns_batch - cost_value_batch).pow(2).mean()
+
+        cost_value_clipped = target_cost_values_batch + (
+            cost_value_batch - target_cost_values_batch
+        ).clamp(-self.clip_param, self.clip_param)
+        cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
+        cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
+        return torch.max(cost_value_losses, cost_value_losses_clipped).mean()
+
+    def _compute_penalty_loss(self, minibatch, cost_advantages_batch, cost_violation_batch):
+        actions_log_prob_batch = self.actor_critic.get_actions_log_prob(minibatch.actions)
+        return self.compute_viol(
+            actions_log_prob_batch,
+            minibatch.old_actions_log_prob,
+            cost_advantages_batch,
+            cost_violation_batch,
+        )
+
+    def _accumulate_stats(self, accumulator, values):
+        for key, value in values.items():
+            accumulator[key] += value.detach()
+
+    def _average_accumulator(self, accumulator, num_updates):
+        for key in accumulator.keys():
+            accumulator[key] /= num_updates
 
     def init_storage(
         self, 
@@ -85,15 +161,7 @@ class NP3O(PPO):
         if cost_shape is None:
             raise ValueError("cost_shape must be provided for NP3O")
         
-        # Convert k_value to tensor if needed, matching cost dimensions
-        if not isinstance(self.k_value, torch.Tensor):
-            self.k_value = torch.tensor(
-                [self.k_value] * cost_shape[0] if isinstance(cost_shape, tuple) else [self.k_value],
-                dtype=torch.float32,
-                device=self.device
-            )
-        else:
-            self.k_value = self.k_value.to(self.device)
+        self.k_value = self._to_cost_tensor(self.k_value, cost_shape)
             
         self.storage = RolloutStorageWithCost(
             num_envs,
@@ -118,8 +186,8 @@ class NP3O(PPO):
         
         # Evaluate cost values using Cost Critic (analogous to value estimation)
         with torch.no_grad():
-            critic_input = critic_obs if critic_obs is not None else obs
-            self.transition.cost_values = self.actor_critic.evaluate_cost(critic_input).detach()
+            critic_input = self._get_cost_critic_input(obs, critic_obs)
+            self.transition.cost_values = self._evaluate_cost(critic_input).detach()
         
         # Note: self.transition.costs is set in process_env_step(), not here
         # This is the same pattern as rewards in PPO
@@ -146,20 +214,8 @@ class NP3O(PPO):
         # Record costs
         self.transition.costs = costs.clone()
         
-        # Handle timeout bootstrapping for costs
-        # When episode is truncated (time_out=1, done=1), we need to add
-        # bootstrapped future cost value to current cost
         bootstrap_obs = next_critic_obs_for_bootstrap if next_critic_obs_for_bootstrap is not None else next_critic_obs
-        
-        if 'time_outs' in infos and bootstrap_obs is not None:
-            time_outs = infos['time_outs'].to(self.device)
-            
-            with torch.no_grad():
-                bootstrap_cost_values = self.actor_critic.evaluate_cost(bootstrap_obs).detach()
-            
-            # Bootstrap: cost += gamma * V_cost(next_state) for timed-out episodes
-            # This corrects the TD target when done=True but episode was just truncated
-            self.transition.costs = self.transition.costs + self.gamma * bootstrap_cost_values * time_outs.unsqueeze(-1)
+        self.transition.costs = self._bootstrap_timeout_costs(self.transition.costs, infos, bootstrap_obs)
 
         # Call parent's process_env_step (handles rewards, values, storage)
         super().process_env_step(rewards, dones, infos, next_obs, next_critic_obs, next_critic_obs_for_bootstrap)
@@ -171,19 +227,7 @@ class NP3O(PPO):
         globally per dimension before the minibatch generator is called, exactly like costs.
         """
         super().compute_returns(last_critic_obs)
-        
-        # PPO's RolloutStorage does a global scalar normalization.
-        # Here we explicitly enforce per-dimension global normalization 
-        # (in case num_rewards > 1) just like RolloutStorageWithCost does for costs,
-        # ensuring reward advantages have exact N(0,1) global scale.
-        adv = self.storage.advantages
-        num_transitions, num_envs, num_rewards = adv.shape
-        adv_flat = adv.view(-1, num_rewards)
-        
-        # Re-normalize globally per reward dimension
-        adv_mean = adv_flat.mean(dim=0).view(1, 1, -1)
-        adv_std = adv_flat.std(dim=0).view(1, 1, -1)
-        self.storage.advantages = (adv - adv_mean) / (adv_std + 1e-8)
+        self._normalize_reward_advantages()
 
     def compute_cost_returns(self, last_critic_obs):
         """
@@ -191,7 +235,7 @@ class NP3O(PPO):
         Also computes normalized cost violation term.
         """
         with torch.no_grad():
-            last_cost_values = self.actor_critic.evaluate_cost(last_critic_obs).detach()
+            last_cost_values = self._evaluate_cost(last_critic_obs).detach()
         self.storage.compute_cost_returns(last_cost_values, self.gamma, self.lam)
 
     def compute_cost_surrogate_loss(self, actions_log_prob_batch, old_actions_log_prob_batch, cost_advantages_batch):
@@ -261,18 +305,17 @@ class NP3O(PPO):
         
         return cost_loss
 
-    def update_adaptive_constraints(self, current_mean_costs):
+    def update_adaptive_constraints(self, current_cost_returns):
         """
         Update active constraint thresholds based on current rollout performance.
         
-        Implements Kim et al. (2024) adaptive threshold strategy:
-        d_new = max(d_target, J_current - alpha * d_target)
-        
-        This creates a "moving goalpost" that's slightly better than current performance,
-        encouraging gradual improvement while avoiding overly aggressive penalties.
+        For zero-threshold tasks, adaptive relaxation is disabled and the active
+        threshold stays fixed at the target. For non-zero thresholds, use a
+        conservative interpolation on the same return scale as J_C:
+        d_active = max(d_target, (1 - beta) * J_current + beta * d_target)
         
         Args:
-            current_mean_costs: Mean cost per constraint from current rollout, shape (num_costs,)
+            current_cost_returns: Mean discounted cost return per constraint from current rollout, shape (num_costs,)
             
         Returns:
             Updated active threshold values, or None if thresholds not configured
@@ -282,15 +325,15 @@ class NP3O(PPO):
             return None
         
         # Ensure tensors are on same device
-        if current_mean_costs.device != target_d.device:
-            current_mean_costs = current_mean_costs.to(target_d.device)
-        
-        # Calculate margin based on target threshold
-        margin = self.adaptive_alpha * target_d
-        
-        # New threshold: max(target, current - margin)
-        # This ensures the threshold is never below target, but can be relaxed above target
-        new_active_d = torch.max(target_d, current_mean_costs - margin)
+        if current_cost_returns.device != target_d.device:
+            current_cost_returns = current_cost_returns.to(target_d.device)
+
+        if torch.allclose(target_d, torch.zeros_like(target_d)):
+            new_active_d = target_d
+        else:
+            beta = torch.as_tensor(self.adaptive_beta, dtype=target_d.dtype, device=target_d.device)
+            relaxed_d = (1.0 - beta) * current_cost_returns + beta * target_d
+            new_active_d = torch.max(target_d, relaxed_d)
         
         # Update storage with new active thresholds
         self.storage.update_active_d_values(new_active_d)
@@ -332,66 +375,33 @@ class NP3O(PPO):
         mean_losses = defaultdict(float)
         average_stats = defaultdict(float)
         
-        # Select appropriate batch generator
-        if self.actor_critic.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
-        else:
-            generator = self.storage.mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
+        generator = self._get_batch_generator()
             
         for minibatch_data in generator:
-            # Unpack augmented minibatch
             minibatch = minibatch_data[0]
             target_cost_values_batch = minibatch_data[1]
             cost_advantages_batch = minibatch_data[2]
             cost_returns_batch = minibatch_data[3]
             cost_violation_batch = minibatch_data[4]
 
-            # Step 1: Compute standard PPO losses (surrogate, value, entropy)
             losses, inter_vars, stats = self.compute_losses(minibatch)
-            
-            # Step 2: Compute Cost Critic loss
-            critic_hidden_states = minibatch.hidden_states.critic if self.actor_critic.is_recurrent else None
-            cost_value_batch = self.actor_critic.evaluate_cost(
-                minibatch.critic_obs, 
-                masks=minibatch.masks, 
-                hidden_states=critic_hidden_states
+            cost_value_loss = self._compute_cost_value_loss(
+                minibatch,
+                target_cost_values_batch,
+                cost_returns_batch,
             )
-            
-            # Cost Value Loss with optional clipping
-            if self.use_clipped_value_loss:
-                cost_value_clipped = target_cost_values_batch + (
-                    cost_value_batch - target_cost_values_batch
-                ).clamp(-self.clip_param, self.clip_param)
-                
-                cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
-                cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
-                cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
-            else:
-                cost_value_loss = (cost_returns_batch - cost_value_batch).pow(2).mean()
-
-            # Step 3: Compute Violation Loss (P3O core)
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(minibatch.actions)
-            viol_loss = self.compute_viol(
-                actions_log_prob_batch, 
-                minibatch.old_actions_log_prob, 
-                cost_advantages_batch, 
-                cost_violation_batch
+            viol_loss = self._compute_penalty_loss(
+                minibatch,
+                cost_advantages_batch,
+                cost_violation_batch,
             )
 
-            # Step 4: Combine all losses
             total_loss = 0.0
-            
-            # PPO losses (surrogate, value, entropy)
             for k, v in losses.items():
                 coef = getattr(self, k + "_coef", 1.0)
                 total_loss = total_loss + coef * v
                 mean_losses[k] += v.detach()
             
-            # NP3O specific losses
             total_loss = total_loss + self.cost_value_loss_coef * cost_value_loss
             total_loss = total_loss + self.cost_viol_loss_coef * viol_loss
             
@@ -399,19 +409,12 @@ class NP3O(PPO):
             mean_losses["viol_loss"] += viol_loss.detach()
             mean_losses["total_loss"] += total_loss.detach()
 
-            # Collect stats
-            for k, v in stats.items():
-                average_stats[k] += v.detach()
-            
-            # Step 5: Gradient step
+            self._accumulate_stats(average_stats, stats)
             self.gradient_step(total_loss, average_stats)
 
-        # Compute mean losses over all updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
-        for k in mean_losses.keys():
-            mean_losses[k] /= num_updates
-        for k in average_stats.keys():
-            average_stats[k] /= num_updates
+        self._average_accumulator(mean_losses, num_updates)
+        self._average_accumulator(average_stats, num_updates)
             
         # Clear storage
         self.storage.clear()

@@ -115,6 +115,8 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         
         # Cost tracking buffers
         self._cost_buffer = deque(maxlen=100)
+        self._mean_cost_return = None
+        self._mean_discounted_cost_violation = None
 
         _, _ = self.env.reset()
 
@@ -309,21 +311,21 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
                 # Compute returns for rewards (same as PPO)
                 self.alg.compute_returns(critic_input)
                 
-                # --- Adaptive Threshold Update (Kim et al. 2024) ---
-                # Update constraint thresholds based on current rollout performance
-                # before computing cost returns/violation
-                with torch.no_grad():
-                    # Calculate mean cost per constraint from current rollout
-                    # costs shape: [num_steps, num_envs, num_costs] -> mean: [num_costs]
-                    current_mean_costs = self.alg.storage.costs.mean(dim=(0, 1))
-                    
-                    # Update adaptive thresholds (modifies storage.active_cost_d_values)
-                    if hasattr(self.alg, 'update_adaptive_constraints'):
-                        self.alg.update_adaptive_constraints(current_mean_costs)
-                
-                # Compute returns for costs (NP3O specific)
-                # Now uses updated active thresholds for violation calculation
                 self.alg.compute_cost_returns(critic_input)
+
+                # --- Adaptive Threshold Update (Kim et al. 2024) ---
+                # Use rollout cost returns instead of per-step costs so thresholds
+                # stay on the same scale as the P3O violation term.
+                with torch.no_grad():
+                    current_cost_returns = self.alg.storage.cost_returns.mean(dim=(0, 1))
+                    self._mean_cost_return = current_cost_returns.detach().clone()
+                    self._mean_discounted_cost_violation = (
+                        (1.0 - self.alg.gamma) * current_cost_returns
+                    ).detach().clone()
+
+                    if hasattr(self.alg, 'update_adaptive_constraints'):
+                        self.alg.update_adaptive_constraints(current_cost_returns)
+                        self.alg.storage.update_cost_violation(self.alg.gamma)
 
             losses, stats = self.alg.update(self.current_learning_iteration)
             stop = time.time()
@@ -354,8 +356,25 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         
         # Log cost-specific metrics
         if self._cost_buffer:
-            mean_cost = statistics.mean(self._cost_buffer)
-            self.writer_mp_add_scalar("Train/mean_cost_per_step", mean_cost, self.current_learning_iteration)
+            mean_step_cost = statistics.mean(self._cost_buffer)
+            self.writer_mp_add_scalar("Train/mean_step_cost", mean_step_cost, self.current_learning_iteration)
+            self.writer_mp_add_scalar("Train/mean_cost_per_step", mean_step_cost, self.current_learning_iteration)
+
+            if self._mean_cost_return is not None:
+                for i in range(len(self._mean_cost_return)):
+                    self.writer_mp_add_scalar(
+                        f"Train/cost_{i}_mean_return",
+                        self._mean_cost_return[i].item(),
+                        self.current_learning_iteration,
+                    )
+
+            if self._mean_discounted_cost_violation is not None:
+                for i in range(len(self._mean_discounted_cost_violation)):
+                    self.writer_mp_add_scalar(
+                        f"Train/cost_{i}_mean_discounted_violation_level",
+                        self._mean_discounted_cost_violation[i].item(),
+                        self.current_learning_iteration,
+                    )
             
             # Log k_value if available
             if hasattr(self.alg, 'k_value'):
