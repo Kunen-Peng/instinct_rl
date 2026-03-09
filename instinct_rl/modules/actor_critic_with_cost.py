@@ -9,6 +9,11 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Optional
 from instinct_rl.modules.actor_critic import ActorCritic
+from instinct_rl.modules.cost_critic import (
+    MultiHeadCostCritic,
+    VectorCostCritic,
+    resolve_multi_head_dims,
+)
 
 
 class ActorCriticWithCost(ActorCritic):
@@ -34,6 +39,9 @@ class ActorCriticWithCost(ActorCritic):
         actor_hidden_dims: List[int] = [256, 256, 256],
         critic_hidden_dims: List[int] = [256, 256, 256],
         cost_critic_hidden_dims: Optional[List[int]] = None,  # Defaults to critic_hidden_dims if None
+        cost_critic_type: str = "vector_head",
+        cost_backbone_hidden_dims: Optional[List[int]] = None,
+        cost_head_hidden_dims: Optional[List[int]] = None,
         activation: str = "elu",
         init_noise_std: float = 1.0,
         **kwargs,
@@ -49,6 +57,9 @@ class ActorCriticWithCost(ActorCritic):
             actor_hidden_dims: Hidden layer sizes for actor
             critic_hidden_dims: Hidden layer sizes for reward critic
             cost_critic_hidden_dims: Hidden layer sizes for cost critic (defaults to critic_hidden_dims)
+            cost_critic_type: Cost-critic architecture, one of {"vector_head", "multi_head"}
+            cost_backbone_hidden_dims: Shared backbone sizes for multi-head cost critic
+            cost_head_hidden_dims: Per-head MLP sizes for multi-head cost critic
             activation: Activation function name
             init_noise_std: Initial action noise std
         """
@@ -69,66 +80,43 @@ class ActorCriticWithCost(ActorCritic):
         if cost_critic_hidden_dims is None:
             cost_critic_hidden_dims = critic_hidden_dims
         self.cost_critic_hidden_dims = cost_critic_hidden_dims
+        self.cost_critic_type = cost_critic_type
+        self.cost_backbone_hidden_dims, self.cost_head_hidden_dims = resolve_multi_head_dims(
+            default_hidden_dims=self.cost_critic_hidden_dims,
+            backbone_hidden_dims=cost_backbone_hidden_dims,
+            head_hidden_dims=cost_head_hidden_dims,
+        )
         
         if self.num_costs > 0:
-            print(f"[ActorCriticWithCost] Building Cost Critic with {self.num_costs} cost types")
-            # Build cost critic with same input as reward critic
+            print(
+                f"[ActorCriticWithCost] Building {self.cost_critic_type} cost critic with {self.num_costs} cost types"
+            )
             self.cost_critic = self._build_cost_critic(num_costs=self.num_costs)
             print(f"[ActorCriticWithCost] Cost Critic architecture: {self.cost_critic}")
         else:
             print("[ActorCriticWithCost] Warning: Initialized with num_costs=0, no cost critic built")
             self.cost_critic = None
 
-    def _build_cost_critic(self, num_costs: int) -> nn.Sequential:
+    def _build_cost_critic(self, num_costs: int) -> nn.Module:
         """
         Build the cost critic network.
-        
-        Uses the same input dimension as the reward critic (mlp_input_dim_c).
-        Applies orthogonal initialization for stable training.
-        
-        Args:
-            num_costs: Number of cost values to predict
-            
-        Returns:
-            Cost critic network as nn.Sequential
         """
-        import numpy as np
-        from instinct_rl.modules.actor_critic import get_activation
-        
-        activation = get_activation(self.activation)
-        hidden_dims = self.cost_critic_hidden_dims
-        
-        layers = []
-        layers.append(nn.Linear(self.mlp_input_dim_c, hidden_dims[0]))
-        layers.append(activation)
-        
-        for l in range(len(hidden_dims)):
-            if l == len(hidden_dims) - 1:
-                # Output layer
-                layers.append(nn.Linear(hidden_dims[l], num_costs))
-            else:
-                layers.append(nn.Linear(hidden_dims[l], hidden_dims[l + 1]))
-                layers.append(activation)
-        
-        model = nn.Sequential(*layers)
-        
-        # --- Weight Initialization for Stability ---
-        # Orthogonal init with appropriate gains for each layer
-        output_layer = None
-        for i, m in enumerate(model.modules()):
-            if isinstance(m, nn.Linear):
-                # Orthogonal initialization (better for RL)
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
-                output_layer = m  # Track last linear layer
-        
-        # Small gain for output layer to ensure near-zero initial predictions
-        # This prevents large initial cost values causing gradient explosion
-        if output_layer is not None:
-            nn.init.orthogonal_(output_layer.weight, gain=0.01)
-            nn.init.constant_(output_layer.bias, 0.0)
-                
-        return model
+        if self.cost_critic_type == "vector_head":
+            return VectorCostCritic(
+                input_dim=self.mlp_input_dim_c,
+                hidden_dims=self.cost_critic_hidden_dims,
+                num_costs=num_costs,
+                activation_name=self.activation,
+            )
+        if self.cost_critic_type == "multi_head":
+            return MultiHeadCostCritic(
+                input_dim=self.mlp_input_dim_c,
+                num_costs=num_costs,
+                activation_name=self.activation,
+                backbone_hidden_dims=self.cost_backbone_hidden_dims,
+                head_hidden_dims=self.cost_head_hidden_dims,
+            )
+        raise ValueError(f"Unsupported cost_critic_type: {self.cost_critic_type}")
 
     def evaluate_cost(
         self, 
@@ -160,3 +148,19 @@ class ActorCriticWithCost(ActorCritic):
         super().reset(dones)
         # Cost critic is currently MLP, no internal state to reset
         # If recurrent cost critic is added, handle reset here
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Load checkpoints with backward compatibility for older vector cost-critic keys."""
+        remapped_state_dict = dict(state_dict)
+        remapped_keys = {}
+
+        for key in list(remapped_state_dict.keys()):
+            if key.startswith("cost_critic.") and not key.startswith("cost_critic.model."):
+                suffix = key[len("cost_critic.") :]
+                if suffix and suffix[0].isdigit():
+                    remapped_keys[key] = f"cost_critic.model.{suffix}"
+
+        for old_key, new_key in remapped_keys.items():
+            remapped_state_dict[new_key] = remapped_state_dict.pop(old_key)
+
+        return super().load_state_dict(remapped_state_dict, strict=strict, assign=assign)
