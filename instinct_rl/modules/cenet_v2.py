@@ -23,7 +23,6 @@ class CENetV2(nn.Module):
     def __init__(self,
                  num_encoder_obs,
                  num_decoder_obs,
-                 num_est_h=0, 
                  num_est_v=3, 
                  num_est_z=16,
                  decoder_hidden_dim=[256, 128],
@@ -31,7 +30,7 @@ class CENetV2(nn.Module):
                  rnn_hidden_size=256,  # GRU 隐藏层维度，可通过 cenet 配置覆盖
                  rnn_num_layers=2,     # GRU 层数，可通过 cenet 配置覆盖
                  pre_embedding_dim=128, # Pre-Embedding 输出维度（GRU 的 input_size）
-                 physical_heads_num_layers=1, # 速度和高度头的层数（1代表仅Linear, 2代表Linear->ELU->Linear）
+                 physical_heads_num_layers=1, # 速度头深度（1代表仅Linear, 2代表Linear->ELU->Linear）
                  **kwargs):
         super(CENetV2, self).__init__()
         
@@ -39,7 +38,7 @@ class CENetV2(nn.Module):
         self.dim_z = num_est_z  # 16
         
         # 实际的 Latent 维度 (Policy 和 Decoder 看到的维度) = 3 + 16 = 19
-        self.latent_dim = num_est_h + num_est_v + num_est_z
+        self.latent_dim = num_est_v + num_est_z
         
         self.raw_encoder_input_dim = num_encoder_obs
         
@@ -77,16 +76,6 @@ class CENetV2(nn.Module):
         # 隐变量方差头
         self.z_logstd_head = nn.Linear(rnn_hidden_size, num_est_z)
         
-        # 足端高度预测头 (只处理物理量)
-        if physical_heads_num_layers == 1:
-            self.h_head = nn.Linear(rnn_hidden_size, 4)
-        else:
-            self.h_head = nn.Sequential(
-                nn.Linear(rnn_hidden_size, max(32, rnn_hidden_size // 4)),
-                nn.ELU(),
-                nn.Linear(max(32, rnn_hidden_size // 4), 4)
-            )
-
         # Decoder 输入 19 维 (self.latent_dim=19)
         self.decoder = MLP(input_dim=self.latent_dim, 
                            hidden_dims=decoder_hidden_dim, 
@@ -96,7 +85,6 @@ class CENetV2(nn.Module):
         # 初始化缓存变量
         self.full_mean = None
         self.z_logvar = None
-        self.h_pred = None
         
         Normal.set_default_validate_args = False
 
@@ -120,10 +108,6 @@ class CENetV2(nn.Module):
     @property
     def encoder_logvar(self):
         return self.z_logvar # [Batch, 16]
-        
-    @property
-    def encoder_h_pred(self):
-        return self.h_pred # [Batch, 4]
 
     def encode(self, observations, hidden_states=None, masks=None, **kwargs):
         """
@@ -155,7 +139,6 @@ class CENetV2(nn.Module):
         v_mean = self.v_head(last_features)
         z_mean = self.z_mean_head(last_features)
         z_log_std = self.z_logstd_head(last_features)
-        self.h_pred = self.h_head(last_features)  # Save height prediction
         
         # 拼接完整的 Mean (用于 Loss 计算) -> [Batch, 19]
         self.full_mean = torch.cat([v_mean, z_mean], dim=-1)

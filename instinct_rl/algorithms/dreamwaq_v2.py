@@ -17,7 +17,6 @@ class RolloutStorageDreamWaQ(RolloutStorage):
             super().__init__()
             self.single_obs = None
             self.rewards_noClip = None
-            self.true_feet_height = None
 
     MiniBatch = namedtuple(
         "MiniBatch",
@@ -25,7 +24,6 @@ class RolloutStorageDreamWaQ(RolloutStorage):
             *RolloutStorage.MiniBatch._fields,
             "single_obs",
             "dones",
-            "true_feet_height",
         ],
     )
 
@@ -36,12 +34,10 @@ class RolloutStorageDreamWaQ(RolloutStorage):
         
         self.single_obs = torch.zeros(num_transitions_per_env, num_envs, num_single_obs, device=self.device)
         self.rewards_noClip = torch.zeros(num_transitions_per_env, num_envs, num_rewards, device=self.device)
-        self.true_feet_height = torch.zeros(num_transitions_per_env, num_envs, 4, device=self.device)
 
     def add_transitions(self, transition: Transition):
         self.single_obs[self.step].copy_(transition.single_obs)
         self.rewards_noClip[self.step].copy_(transition.rewards_noClip.view(-1, self.num_rewards))
-        self.true_feet_height[self.step].copy_(transition.true_feet_height)
         super().add_transitions(transition)
 
     def get_minibatch_from_selection(self, T_select, B_select, padded_B_slice=None, prev_done_mask=None):
@@ -50,13 +46,11 @@ class RolloutStorageDreamWaQ(RolloutStorage):
         if padded_B_slice is None:
             single_obs_batch = self.single_obs[T_select, B_select]
             dones_batch = self.dones[T_select, B_select].float()
-            true_feet_height_batch = self.true_feet_height[T_select, B_select]
         else:
             single_obs_batch = self.single_obs[T_select, B_select]
             dones_batch = self.dones[T_select, B_select].float()
-            true_feet_height_batch = self.true_feet_height[T_select, B_select]
 
-        return RolloutStorageDreamWaQ.MiniBatch(*minibatch, single_obs_batch, dones_batch, true_feet_height_batch)
+        return RolloutStorageDreamWaQ.MiniBatch(*minibatch, single_obs_batch, dones_batch)
 
 
 class PPODreamWaQV2(PPO):
@@ -77,7 +71,6 @@ class PPODreamWaQV2(PPO):
                  schedule="fixed",
                  desired_kl=0.01,
                  vae_beta=0.5,
-                 weight_ht=10.0,
                  use_Adaboot = True,
                  num_estimator_epochs = 1, # Multiple gradient steps per minbatch for VAE akin to rsl_rl
                  device='cpu',
@@ -90,7 +83,6 @@ class PPODreamWaQV2(PPO):
         self.cenet = cenet
         self.cenet.to(self.device)
         self.vae_beta = vae_beta
-        self.weight_ht = weight_ht
         self.use_Adaboot = use_Adaboot
         self.num_estimator_epochs = num_estimator_epochs
         
@@ -100,7 +92,7 @@ class PPODreamWaQV2(PPO):
         self.min_vae_beta = kwargs.pop('min_vae_beta', 0.01)
         self.max_vae_beta = kwargs.pop('max_vae_beta', 0.5)     # Max Beta = 0.5
         
-        self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(6)]
+        self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(5)]
         self.Pboot = torch.tensor(1.0, device=self.device)
         self.optimizer_cenet = optim.Adam(self.cenet.parameters(), lr=learning_rate)
         self.use_estimate=False
@@ -181,15 +173,6 @@ class PPODreamWaQV2(PPO):
                 # Assume tensor is the critic obs directly if not dict
                 true_next_critic_obs[term_ids] = term_obs
 
-        # Prefer runner-provided raw terrain-relative foot clearance.
-        if "true_feet_height" in infos:
-            self.transition.true_feet_height = infos["true_feet_height"].detach()
-        else:
-            self.transition.true_feet_height = get_subobs_by_components(
-                true_next_critic_obs,
-                ["foot_height_scan"],
-                self.actor_critic.critic_obs_segments,
-            ).detach()
         self.transition.single_obs = true_next_critic_obs[:,:num_single_obs]
         self.transition.rewards_noClip = rewards_noClip.clone()
         self.transition.rewards = rewards.clone()
@@ -235,7 +218,6 @@ class PPODreamWaQV2(PPO):
         mean_loss_vt = torch.tensor(0.0, device=self.device)
         mean_loss_ot = torch.tensor(0.0, device=self.device)
         mean_loss_kl = torch.tensor(0.0, device=self.device)
-        mean_loss_ht = torch.tensor(0.0, device=self.device)
         mean_loss_est = torch.tensor(0.0, device=self.device)
         
         self.use_estimate = self.compute_Pboot() 
@@ -260,7 +242,6 @@ class PPODreamWaQV2(PPO):
             
             lin_vel = get_subobs_by_components(minibatch.critic_obs, ["base_lin_vel"], 
                                                 self.actor_critic.critic_obs_segments)
-            foot_height = minibatch.true_feet_height
             
             raw_obs = minibatch.obs[..., :self.cenet.raw_encoder_input_dim]
             valid = ~minibatch.dones.squeeze(-1).bool()  # (batch,) True for non-terminal
@@ -273,12 +254,11 @@ class PPODreamWaQV2(PPO):
                 kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar[valid] - est_mean[valid, -16:] ** 2 - torch.exp(est_logvar[valid]), dim=1))
                 
                 loss_vt = torch.nn.functional.mse_loss(est_mean[valid, :3], lin_vel[valid])
-                loss_ht = self._masked_mse(self.cenet.encoder_h_pred, foot_height, minibatch.dones)
                 
                 est_obs = self.cenet.decode(z_sample)
                 loss_ot = torch.nn.functional.mse_loss(est_obs[valid], minibatch.single_obs[valid])
                 
-                cenet_loss = loss_vt + loss_ot + self.weight_ht * loss_ht + self.vae_beta * kl_loss
+                cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
                 
                 self.optimizer_cenet.zero_grad()
                 cenet_loss.backward()
@@ -288,7 +268,6 @@ class PPODreamWaQV2(PPO):
                 mean_loss_vt += loss_vt
                 mean_loss_ot += loss_ot
                 mean_loss_kl += kl_loss
-                mean_loss_ht += loss_ht
                 mean_loss_est += cenet_loss
                 
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -300,14 +279,13 @@ class PPODreamWaQV2(PPO):
         mean_loss_vt /= est_updates
         mean_loss_ot /= est_updates
         mean_loss_kl /= est_updates
-        mean_loss_ht /= est_updates
         mean_loss_est /= est_updates
         
         # --- Adaptive Beta Scheduling ---
         k_beta = math.exp(self.beta_delta * (self.target_mse_ot - mean_loss_ot.item()))
         self.vae_beta = max(self.min_vae_beta, min(self.max_vae_beta, self.vae_beta * k_beta))
         
-        self.cenet_loss_list = [mean_loss_vt, mean_loss_ot, mean_loss_kl, mean_loss_est, self.Pboot, mean_loss_ht]
+        self.cenet_loss_list = [mean_loss_vt, mean_loss_ot, mean_loss_kl, mean_loss_est, self.Pboot]
             
         self.storage.clear()
         
@@ -316,7 +294,6 @@ class PPODreamWaQV2(PPO):
             "estimator_mse_vt": self.cenet_loss_list[0],
             "estimator_mse_ot": self.cenet_loss_list[1],
             "estimator_kl": self.cenet_loss_list[2],
-            "estimator_mse_ht": self.cenet_loss_list[5],
             "Pboot": self.Pboot
         }
 
@@ -476,7 +453,6 @@ class PPODreamWaQRecurrentV2(PPODreamWaQV2):
         mean_loss_vt = torch.tensor(0.0, device=self.device)
         mean_loss_ot = torch.tensor(0.0, device=self.device)
         mean_loss_kl = torch.tensor(0.0, device=self.device)
-        mean_loss_ht = torch.tensor(0.0, device=self.device)
         mean_loss_est = torch.tensor(0.0, device=self.device)
         
         self.use_estimate = self.compute_Pboot() 
@@ -500,7 +476,6 @@ class PPODreamWaQRecurrentV2(PPODreamWaQV2):
             
             lin_vel = get_subobs_by_components(minibatch.critic_obs, ["base_lin_vel"], 
                                                 self.actor_critic.critic_obs_segments)
-            foot_height = minibatch.true_feet_height
             
             # Raw obs for CENet
             # Use raw encoder input dimension to extract correct input before Pre-Embedding
@@ -508,51 +483,58 @@ class PPODreamWaQRecurrentV2(PPODreamWaQV2):
             raw_obs = minibatch.obs[..., :raw_obs_dim] 
             
             cenet_hidden_states = minibatch.cenet_hidden_states
-            h_0 = cenet_hidden_states.permute(1, 0, 2).contiguous()
-            
-            z_sample = self.cenet.encode(raw_obs, hidden_states=h_0)
-            
-            est_mean = self.cenet.encoder_mean
-            est_logvar = self.cenet.encoder_logvar
-            
             valid = ~minibatch.dones.squeeze(-1).bool()  # (batch,) True for non-terminal
-            
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + est_logvar[valid] - est_mean[valid, -16:] ** 2 - torch.exp(est_logvar[valid]), dim=1))
-            
-            loss_vt = torch.nn.functional.mse_loss(est_mean[valid, :3], lin_vel[valid])
-            loss_ht = self._masked_mse(self.cenet.encoder_h_pred, foot_height, minibatch.dones)
-            
-            est_obs = self.cenet.decode(z_sample)
-            loss_ot = torch.nn.functional.mse_loss(est_obs[valid], minibatch.single_obs[valid])
-            
-            cenet_loss = loss_vt + loss_ot + self.weight_ht * loss_ht + self.vae_beta * kl_loss
-            
-            self.optimizer_cenet.zero_grad()
-            cenet_loss.backward()
-            nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
-            self.optimizer_cenet.step()
-            
-            mean_loss_vt += loss_vt
-            mean_loss_ot += loss_ot
-            mean_loss_kl += kl_loss
-            mean_loss_ht += loss_ht
-            mean_loss_est += cenet_loss
+            h_0 = cenet_hidden_states.permute(1, 0, 2).contiguous()
+
+            # Reuse the same rollout hidden state for every inner estimator update.
+            # We intentionally do not carry hidden states across epochs here: each
+            # epoch should optimize the same sequence snapshot, not advance the GRU.
+            for _ in range(self.num_estimator_epochs):
+                z_sample = self.cenet.encode(raw_obs, hidden_states=h_0)
+                
+                est_mean = self.cenet.encoder_mean
+                est_logvar = self.cenet.encoder_logvar
+                
+                kl_loss = torch.mean(
+                    -0.5
+                    * torch.sum(
+                        1 + est_logvar[valid] - est_mean[valid, -16:] ** 2 - torch.exp(est_logvar[valid]),
+                        dim=1,
+                    )
+                )
+                
+                loss_vt = torch.nn.functional.mse_loss(est_mean[valid, :3], lin_vel[valid])
+                
+                est_obs = self.cenet.decode(z_sample)
+                loss_ot = torch.nn.functional.mse_loss(est_obs[valid], minibatch.single_obs[valid])
+                
+                cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
+                
+                self.optimizer_cenet.zero_grad()
+                cenet_loss.backward()
+                nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
+                self.optimizer_cenet.step()
+                
+                mean_loss_vt += loss_vt
+                mean_loss_ot += loss_ot
+                mean_loss_kl += kl_loss
+                mean_loss_est += cenet_loss
                 
         num_updates = self.num_learning_epochs * self.num_mini_batches
+        est_updates = num_updates * self.num_estimator_epochs
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         
-        mean_loss_vt /= num_updates
-        mean_loss_ot /= num_updates
-        mean_loss_kl /= num_updates
-        mean_loss_ht /= num_updates
-        mean_loss_est /= num_updates
+        mean_loss_vt /= est_updates
+        mean_loss_ot /= est_updates
+        mean_loss_kl /= est_updates
+        mean_loss_est /= est_updates
         
         # --- Adaptive Beta Scheduling ---
         k_beta = math.exp(self.beta_delta * (self.target_mse_ot - mean_loss_ot.item()))
         self.vae_beta = max(self.min_vae_beta, min(self.max_vae_beta, self.vae_beta * k_beta))
         
-        self.cenet_loss_list = [mean_loss_vt, mean_loss_ot, mean_loss_kl, mean_loss_est, self.Pboot, mean_loss_ht]
+        self.cenet_loss_list = [mean_loss_vt, mean_loss_ot, mean_loss_kl, mean_loss_est, self.Pboot]
             
         self.storage.clear()
         
@@ -561,7 +543,6 @@ class PPODreamWaQRecurrentV2(PPODreamWaQV2):
             "estimator_mse_vt": self.cenet_loss_list[0],
             "estimator_mse_ot": self.cenet_loss_list[1],
             "estimator_kl": self.cenet_loss_list[2],
-            "estimator_mse_ht": self.cenet_loss_list[5],
             "Pboot": self.Pboot
         }
 

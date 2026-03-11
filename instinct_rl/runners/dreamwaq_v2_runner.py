@@ -102,27 +102,6 @@ class DreamWaQRunnerV2(OnPolicyRunner):
         self.normalizers = {}
         # ... (Same as base, omitted for brevity, add if needed)
 
-    def _set_true_feet_height_in_infos(self, infos, next_critic_obs):
-        """Extract terrain-relative foot clearance from unnormalized critic observations."""
-        if next_critic_obs is None:
-            return
-
-        true_next_critic_obs = next_critic_obs.clone()
-        term_ids = infos.get("termination_env_ids", [])
-        if len(term_ids) > 0 and "termination_observations" in infos:
-            term_obs = infos["termination_observations"]
-            if isinstance(term_obs, dict):
-                if "critic" in term_obs:
-                    true_next_critic_obs[term_ids] = term_obs["critic"]
-            else:
-                true_next_critic_obs[term_ids] = term_obs
-
-        infos["true_feet_height"] = get_subobs_by_components(
-            true_next_critic_obs,
-            ["foot_height_scan"],
-            self.alg.actor_critic.critic_obs_segments,
-        ).detach()
-
     def rollout_step(self, obs, critic_obs):
         # We need to extract single_obs (last frame) from obs
         # obs shape: (num_envs, num_encoder_obs) where num_encoder_obs = history * single
@@ -143,8 +122,6 @@ class DreamWaQRunnerV2(OnPolicyRunner):
             rewards.to(self.device),
             dones.to(self.device),
         )
-
-        self._set_true_feet_height_in_infos(infos, next_critic_obs)
         
         # Apply Normalizers (Missing in previous implementation!)
         for obs_group_name, normalizer in self.normalizers.items():
@@ -257,31 +234,8 @@ class DreamWaQRunnerV2(OnPolicyRunner):
                 if self.normalizer is not None:
                     obs = self.normalizer(obs)
                 
-                # Check for term_major reshaping needed before inference
-                encoder = self.cenet.encoder
-                if hasattr(encoder, "obs_layout") and encoder.obs_layout == "term_major" and encoder.term_dims is not None:
-                    batch_size = obs.shape[0]
-                    history_length = encoder.num_history_steps
-                    
-                    term_histories = []
-                    offset = 0
-                    for dim in encoder.term_dims:
-                        chunk_size = dim * history_length
-                        # Slice the flattened history
-                        chunk = obs[:, offset:offset + chunk_size]
-                        # Reshape to [batch, history, dim]
-                        chunk = chunk.view(batch_size, history_length, dim)
-                        term_histories.append(chunk)
-                        offset += chunk_size
-                        
-                    # Concat along features
-                    time_major = torch.cat(term_histories, dim=-1)
-                    # Flatten back out to the input format MLPMixer expects initially
-                    obs_reshaped = time_major.view(batch_size, -1)
-                    latent = self.cenet.encoder_inference(obs_reshaped)
-                else:
-                    # 2. CENet Encoder
-                    latent = self.cenet.encoder_inference(obs)
+                # 2. CENet V2 inference: directly infer latent mean from current observation.
+                latent = self.cenet.encoder_inference(obs)
                 
                 # 3. Concat (Augment observation)
                 obs_aug = torch.cat((obs, latent), dim=-1)
@@ -483,8 +437,6 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
             rewards.to(self.device),
             dones.to(self.device),
         )
-
-        self._set_true_feet_height_in_infos(infos, next_critic_obs)
         
         # Normalizers
         for obs_group_name, normalizer in self.normalizers.items():
@@ -608,32 +560,8 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
                 else:
                     obs_norm = obs
                 
-                # Check for term_major reshaping needed before inference
-                encoder = self.cenet.encoder
-                if hasattr(encoder, "obs_layout") and encoder.obs_layout == "term_major" and encoder.term_dims is not None:
-                    batch_size = obs_norm.shape[0]
-                    history_length = encoder.num_history_steps
-                    
-                    term_histories = []
-                    offset = 0
-                    for dim in encoder.term_dims:
-                        chunk_size = dim * history_length
-                        # Slice the flattened history
-                        chunk = obs_norm[:, offset:offset + chunk_size]
-                        # Reshape to [batch, history, dim]
-                        chunk = chunk.view(batch_size, history_length, dim)
-                        term_histories.append(chunk)
-                        offset += chunk_size
-                        
-                    # Concat along features
-                    time_major = torch.cat(term_histories, dim=-1)
-                    # Flatten back out to the input format MLPMixer expects initially
-                    obs_reshaped = time_major.view(batch_size, -1)
-                    v_mean, next_cenet_hidden_states = self.cenet.encoder_inference_recurrent(obs_reshaped, cenet_hidden_states)
-                else:
-                    # 2. CENet Recurrent Inference
-                    # encoder_inference_recurrent returns (v_mean, next_hidden_states)
-                    v_mean, next_cenet_hidden_states = self.cenet.encoder_inference_recurrent(obs_norm, cenet_hidden_states)
+                # 2. CENet V2 recurrent inference returns (latent_mean, next_hidden_states).
+                v_mean, next_cenet_hidden_states = self.cenet.encoder_inference_recurrent(obs_norm, cenet_hidden_states)
                 
                 # 3. Concat (Augment observation)
                 # Ensure the original normalized obs is concatenated with the returned latent representation
