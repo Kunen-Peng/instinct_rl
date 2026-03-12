@@ -201,6 +201,12 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         # Save CENet
         run_state_dict["cenet_state_dict"] = self.cenet.state_dict()
         run_state_dict["optimizer_cenet_state_dict"] = self.alg.optimizer_cenet.state_dict()
+        run_state_dict.update(
+            {
+                f"{group_name}_normalizer_state_dict": normalizer.state_dict()
+                for group_name, normalizer in self.normalizers.items()
+            }
+        )
         
         run_state_dict.update({
             "iter": self.current_learning_iteration,
@@ -210,13 +216,23 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
 
     def load(self, path):
         """Load with CENet state."""
-        loaded_dict = torch.load(path, map_location=self.device)
+        loaded_dict = torch.load(path, map_location=self.device, weights_only=True)
         self.alg.load_state_dict(loaded_dict)
         
         if "cenet_state_dict" in loaded_dict:
             self.cenet.load_state_dict(loaded_dict["cenet_state_dict"])
         if "optimizer_cenet_state_dict" in loaded_dict:
             self.alg.optimizer_cenet.load_state_dict(loaded_dict["optimizer_cenet_state_dict"])
+
+        for group_name, normalizer in self.normalizers.items():
+            key = f"{group_name}_normalizer_state_dict"
+            if key not in loaded_dict:
+                print(
+                    f"\033[1;36m Warning, normalizer for {group_name} is not found, the state dict is not loaded"
+                    " \033[0m"
+                )
+            else:
+                normalizer.load_state_dict(loaded_dict[key])
             
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]

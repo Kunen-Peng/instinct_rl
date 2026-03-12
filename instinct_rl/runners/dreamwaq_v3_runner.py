@@ -127,3 +127,110 @@ class DreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV2):
             )
             normalizer.to(self.device)
             self.normalizers[obs_group_name] = normalizer
+
+    def get_inference_policy(self, device=None):
+        self.eval_mode()
+        if device is not None:
+            self.alg.actor_critic.to(device)
+            self.cenet.to(device)
+
+        if "policy" in self.normalizers:
+            self.normalizers["policy"].to(device)
+
+        class StatefulPolicy:
+            def __init__(self, runner, device):
+                self.runner = runner
+                self.hidden_states = None
+                self.device = device
+
+            def __call__(self, obs):
+                if self.hidden_states is None:
+                    batch_size = obs.shape[0]
+                    num_layers = self.runner.cenet.rnn.num_layers
+                    hidden_size = self.runner.cenet.rnn.hidden_size
+                    self.hidden_states = torch.zeros(num_layers, batch_size, hidden_size, device=self.device)
+
+                if self.hidden_states.device != obs.device:
+                    self.hidden_states = self.hidden_states.to(obs.device)
+                    self.device = obs.device
+
+                if "policy" in self.runner.normalizers:
+                    obs_norm = self.runner.normalizers["policy"](obs)
+                else:
+                    obs_norm = obs
+
+                latent_mean, next_states = self.runner.cenet.encoder_inference_recurrent(obs_norm, self.hidden_states)
+                self.hidden_states = next_states
+                obs_aug = torch.cat((obs_norm, latent_mean), dim=-1)
+                return self.runner.alg.actor_critic.act_inference(obs_aug)
+
+            def reset(self, dones=None):
+                if hasattr(self.runner.alg, "actor_critic") and hasattr(self.runner.alg.actor_critic, "reset"):
+                    self.runner.alg.actor_critic.reset(dones)
+                if self.hidden_states is not None:
+                    if dones is None:
+                        self.hidden_states.zero_()
+                    else:
+                        self.hidden_states[:, dones, :] = 0.0
+
+        return StatefulPolicy(self, device)
+
+    def export_as_onnx(self, obs, export_model_dir, filename="policy.onnx"):
+        self.eval_mode()
+
+        policy_normalizer = self.normalizers.get("policy")
+        cenet = self.cenet
+        actor_critic = self.alg.actor_critic
+
+        batch_size = obs.shape[0]
+        num_layers = cenet.rnn.num_layers
+        hidden_size = cenet.rnn.hidden_size
+        cenet_hidden_states = torch.zeros(num_layers, batch_size, hidden_size, device=obs.device)
+
+        if policy_normalizer is not None:
+            policy_normalizer = policy_normalizer.to(obs.device)
+
+        class DreamWaQRecurrentV3OnnxWrapper(torch.nn.Module):
+            def __init__(self, normalizer, cenet, actor_critic):
+                super().__init__()
+                self.normalizer = normalizer
+                self.cenet = cenet
+                self.actor_critic = actor_critic
+
+            def forward(self, obs, cenet_hidden_states):
+                if self.normalizer is not None:
+                    obs_norm = self.normalizer(obs)
+                else:
+                    obs_norm = obs
+
+                latent_mean, next_cenet_hidden_states = self.cenet.encoder_inference_recurrent(
+                    obs_norm, cenet_hidden_states
+                )
+                obs_aug = torch.cat((obs_norm, latent_mean), dim=-1)
+                actions = self.actor_critic.act_inference(obs_aug)
+                return actions, next_cenet_hidden_states
+
+        model = DreamWaQRecurrentV3OnnxWrapper(policy_normalizer, cenet, actor_critic)
+        model.eval()
+
+        import os
+
+        os.makedirs(export_model_dir, exist_ok=True)
+        export_path = os.path.join(export_model_dir, filename)
+
+        torch.onnx.export(
+            model,
+            (obs, cenet_hidden_states),
+            export_path,
+            verbose=True,
+            input_names=["obs", "cenet_hidden_states"],
+            output_names=["actions", "next_cenet_hidden_states"],
+            dynamic_axes={
+                "obs": {0: "batch"},
+                "cenet_hidden_states": {1: "batch"},
+                "actions": {0: "batch"},
+                "next_cenet_hidden_states": {1: "batch"},
+            },
+            opset_version=12,
+        )
+        print(f"DreamWaQ V3 recurrent policy exported to {export_path}")
