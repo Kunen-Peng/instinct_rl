@@ -107,6 +107,7 @@ class ActorCriticWithCost(ActorCritic):
                 hidden_dims=self.cost_critic_hidden_dims,
                 num_costs=num_costs,
                 activation_name=self.activation,
+                output_activation=nn.Softplus,
             )
         if self.cost_critic_type == "multi_head":
             return MultiHeadCostCritic(
@@ -115,6 +116,7 @@ class ActorCriticWithCost(ActorCritic):
                 activation_name=self.activation,
                 backbone_hidden_dims=self.cost_backbone_hidden_dims,
                 head_hidden_dims=self.cost_head_hidden_dims,
+                output_activation=nn.Softplus,
             )
         raise ValueError(f"Unsupported cost_critic_type: {self.cost_critic_type}")
 
