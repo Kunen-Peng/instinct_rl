@@ -37,6 +37,7 @@ from .vae_distill import VaeDistill
 from .wasabi import WasabiAlgoMixin, WasabiPPO
 from .dreamwaq import PPODreamWaQ, PPODreamWaQRecurrent
 from .np3o import NP3O
+from .symmetry_ppo import SymmetryPPO
 
 
 
@@ -62,4 +63,5 @@ __all__ = [
     "PPODreamWaQ",
     "PPODreamWaQRecurrent",
     "NP3O",
+    "SymmetryPPO",
 ]

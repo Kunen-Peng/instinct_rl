@@ -37,7 +37,8 @@ from .on_constraint_policy_runner import OnConstraintPolicyRunner
 from .dreamwaq_np3o_runner import DreamWaQNP3ORunner
 from .dreamwaq_runner import DreamWaQRunner, DreamWaQRecurrentRunner
 from .dreamwaq_v2_runner import DreamWaQRunnerV2, DreamWaQRecurrentRunnerV2
-from .dreamwaq_v3_runner import DreamWaQRecurrentRunnerV3
+from .dreamwaq_v3_runner import DreamWaQRecurrentRunnerV3, SymmetryDreamWaQRecurrentRunnerV3
+from .symmetry_on_policy_runner import SymmetryOnPolicyRunner
 
 
 

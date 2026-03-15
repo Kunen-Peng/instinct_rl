@@ -1,8 +1,14 @@
+import time
+from collections import deque
+
 import torch
+import torch.distributed as dist
+from tensorboardX import SummaryWriter
 
 from instinct_rl.algorithms.dreamwaq_v3 import PPODreamWaQRecurrentV3
 from instinct_rl.modules.cenet_v3 import CENetV3 as CENet
 from instinct_rl.runners.dreamwaq_v2_runner import DreamWaQRecurrentRunnerV2
+from instinct_rl.utils.utils import store_code_state
 
 
 class DreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV2):
@@ -234,3 +240,193 @@ class DreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV2):
             opset_version=12,
         )
         print(f"DreamWaQ V3 recurrent policy exported to {export_path}")
+
+
+class SymmetryDreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV3):
+    """DreamWaQ V3 runner with online symmetry rollout in a unified coordinate frame."""
+
+    def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
+        super().__init__(env, train_cfg, log_dir=log_dir, device=device)
+        self.symmetry_cfg = train_cfg.get("symmetry", None)
+        if self.symmetry_cfg is None or not self.symmetry_cfg.get("enabled", False):
+            raise ValueError("SymmetryDreamWaQRecurrentRunnerV3 requires symmetry.enabled=True in the runner config.")
+        if self.env.num_envs % 2 != 0:
+            raise ValueError("SymmetryDreamWaQRecurrentRunnerV3 requires an even number of environments.")
+        self._mirror_start = self.env.num_envs // 2
+        self.symmetry_helper = self._build_symmetry_helper(self.symmetry_cfg["helper_class_name"])
+
+    def _build_symmetry_helper(self, helper_class_name: str):
+        module_name, class_name = helper_class_name.rsplit(":", 1)
+        module = __import__(module_name, fromlist=[class_name])
+        helper_cls = getattr(module, class_name)
+        return helper_cls(self.env.get_obs_format())
+
+    def _mirror_obs_group_tail(self, group_name: str, obs: torch.Tensor | None) -> torch.Tensor | None:
+        if obs is None:
+            return None
+        mirrored = obs.clone()
+        mirrored_tail = self.symmetry_helper.mirror_group(group_name, mirrored[self._mirror_start :])
+        mirrored[self._mirror_start :] = mirrored_tail
+        return mirrored
+
+    def _mirror_action_tail_to_env(self, actions: torch.Tensor) -> torch.Tensor:
+        env_actions = actions.clone()
+        env_actions[self._mirror_start :] = self.symmetry_helper.mirror_actions(env_actions[self._mirror_start :])
+        return env_actions
+
+    def _mirror_observation_dict(self, observations: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {group_name: self._mirror_obs_group_tail(group_name, value) for group_name, value in observations.items()}
+
+    def _mirror_termination_observations(self, infos: dict):
+        term_obs = infos.get("termination_observations")
+        term_env_ids = infos.get("termination_env_ids")
+        if not isinstance(term_obs, dict) or term_env_ids is None or len(term_env_ids) == 0:
+            return
+        mirror_mask = term_env_ids >= self._mirror_start
+        if not torch.any(mirror_mask):
+            return
+        for group_name, value in term_obs.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            mirrored_value = value.clone()
+            mirrored_value[mirror_mask] = self.symmetry_helper.mirror_group(group_name, mirrored_value[mirror_mask])
+            term_obs[group_name] = mirrored_value
+
+    def _prepare_policy_observations(self, obs: torch.Tensor, critic_obs: torch.Tensor | None):
+        obs_policy = self._mirror_obs_group_tail("policy", obs)
+        critic_policy = self._mirror_obs_group_tail("critic", critic_obs) if critic_obs is not None else None
+        return obs_policy, critic_policy
+
+    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if dist.is_initialized():
+            self.alg.distributed_data_parallel()
+            print(f"[INFO rank {dist.get_rank()}]: DistributedDataParallel enabled.")
+        if self.log_dir is not None and self.writer is None and (not self.is_mp_rank_other_process()):
+            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
+        obs, extras = self.env.get_observations()
+        obs = obs.to(self.device)
+        critic_obs = extras["observations"].get("critic", None)
+        critic_obs = critic_obs.to(self.device) if critic_obs is not None else None
+        obs, critic_obs = self._prepare_policy_observations(obs, critic_obs)
+        self.train_mode()
+
+        ep_infos = []
+        step_infos = []
+        rframebuffer = [deque(maxlen=2000) for _ in range(self.env.num_rewards)]
+        rewbuffer = [deque(maxlen=100) for _ in range(self.env.num_rewards)]
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, self.env.num_rewards, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        print(
+            "[INFO{}]: Initialization done, start learning.".format(
+                f" rank {dist.get_rank()}" if dist.is_initialized() else ""
+            )
+        )
+        if self.log_dir is not None and (not self.is_mp_rank_other_process()):
+            store_code_state(self.log_dir, self.git_status_repos)
+        start_iter = self.current_learning_iteration
+        tot_iter = self.current_learning_iteration + num_learning_iterations
+        tot_start_time = time.time()
+        start = time.time()
+        while self.current_learning_iteration < tot_iter:
+            with torch.inference_mode(self.cfg.get("inference_mode_rollout", True)):
+                for _ in range(self.num_steps_per_env):
+                    obs, critic_obs, rewards, dones, infos = self.rollout_step(obs, critic_obs)
+                    if len(rewards.shape) == 1:
+                        rewards = rewards.unsqueeze(-1)
+
+                    if self.log_dir is not None:
+                        if "step" in infos:
+                            step_infos.append(infos["step"])
+                        if "log" in infos:
+                            ep_infos.append(infos["log"])
+                        cur_reward_sum += rewards
+                        cur_episode_length += 1
+                        new_ids = (dones > 0).nonzero(as_tuple=False)[:, 0]
+                        for i in range(self.env.num_rewards):
+                            rframebuffer[i].extend(rewards[dones < 1][:, i].cpu().numpy().tolist())
+                            rewbuffer[i].extend(cur_reward_sum[new_ids][:, i].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+
+                stop = time.time()
+                collection_time = stop - start
+
+                start = stop
+                self.alg.compute_returns(critic_obs if critic_obs is not None else obs)
+
+            losses, stats = self.alg.update(self.current_learning_iteration)
+            stop = time.time()
+            learn_time = stop - start
+            if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
+                self.log(locals())
+            if self.current_learning_iteration % self.save_interval == 0 and self.current_learning_iteration > start_iter:
+                self.save(f"{self.log_dir}/model_{self.current_learning_iteration}.pt")
+            ep_infos.clear()
+            step_infos.clear()
+            self.current_learning_iteration += 1
+            start = time.time()
+
+        self.save(f"{self.log_dir}/model_{self.current_learning_iteration}.pt")
+
+    def rollout_step(self, obs, critic_obs):
+        num_single_obs = self.cenet.decoder.model[-1].out_features
+
+        actions_policy, next_cenet_hidden_states = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
+        self.cenet_hidden_states = next_cenet_hidden_states.detach()
+        actions_env = self._mirror_action_tail_to_env(actions_policy)
+
+        next_obs, rewards, dones, infos = self.env.step(actions_env)
+
+        env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
+        if len(env_ids_done) > 0:
+            self.cenet_hidden_states[:, env_ids_done] = 0.0
+
+        next_critic_obs = infos["observations"].get("critic", None)
+        next_obs, next_critic_obs, rewards, dones = (
+            next_obs.to(self.device),
+            next_critic_obs.to(self.device) if next_critic_obs is not None else None,
+            rewards.to(self.device),
+            dones.to(self.device),
+        )
+
+        infos["observations"] = self._mirror_observation_dict(infos["observations"])
+        self._mirror_termination_observations(infos)
+
+        next_obs = infos["observations"]["policy"]
+        next_critic_obs = infos["observations"].get("critic", None)
+
+        for obs_group_name, normalizer in self.normalizers.items():
+            if obs_group_name == "policy":
+                next_obs = normalizer(next_obs)
+                infos["observations"]["policy"] = next_obs
+            elif obs_group_name == "critic":
+                if next_critic_obs is not None:
+                    next_critic_obs = normalizer(next_critic_obs)
+                    infos["observations"]["critic"] = next_critic_obs
+            else:
+                if obs_group_name in infos["observations"]:
+                    infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
+
+        if "termination_observations" in infos:
+            term_obs = infos["termination_observations"]
+            if isinstance(term_obs, dict):
+                for k, v in term_obs.items():
+                    if k in self.normalizers:
+                        term_obs[k] = self.normalizers[k](v)
+            else:
+                if "critic" in self.normalizers:
+                    infos["termination_observations"] = self.normalizers["critic"](term_obs)
+
+        rewards_noClip = infos.get("rewards_noClip", rewards)
+        if isinstance(rewards_noClip, torch.Tensor):
+            rewards_noClip = rewards_noClip.to(self.device)
+
+        self.alg.process_env_step(rewards, dones, infos, rewards_noClip, num_single_obs, next_obs, next_critic_obs)
+        return next_obs, next_critic_obs, rewards, dones, infos
