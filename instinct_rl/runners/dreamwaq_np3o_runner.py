@@ -62,9 +62,8 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         # Initialize DreamWaQNP3O Algorithm
         alg_class = dreamwaq_np3o_alg.DreamWaQNP3O
         
-        # Check for k_value in env if needed
-        if hasattr(self.env, 'cost_k_values'):
-            self.alg_cfg['k_value'] = self.env.cost_k_values
+        # If the config did not explicitly set the initial k_value, allow the env to provide it.
+        self._configure_initial_k_value()
             
         self.alg = alg_class(
             actor_critic=actor_critic, 

@@ -37,16 +37,23 @@ class NP3O(PPO):
         self,
         actor_critic,
         k_value=1.0,  # Penalty coefficient, can be tensor for multiple constraints
+        initial_k_value=None,  # Optional alias to make the initial k_value explicit in configs
         k_value_max=1.0,  # Maximum k_value cap
         k_value_growth_rate=1.0004,  # Growth rate per update
         k_warmup_iterations=100,  # κ stays at initial value during warmup
         adaptive_beta=None,  # Interpolation factor for adaptive threshold scheduling
         adaptive_alpha=None,  # Backward-compatible alias for adaptive_beta
+        use_adaptive_d_value=True,  # Whether to use adaptive d scheduling at all
+        adaptive_d_warmup_only=False,  # If True, use adaptive d only before warmup ends
+        adaptive_d_warmup_iterations=None,  # Optional override for adaptive d scheduling length
         cost_value_loss_coef=1.0,
         cost_viol_loss_coef=1.0,
         **kwargs
     ):
         super().__init__(actor_critic, **kwargs)
+
+        if initial_k_value is not None:
+            k_value = initial_k_value
         
         # Store initial k_value for reference
         self._initial_k_value = k_value
@@ -58,6 +65,9 @@ class NP3O(PPO):
             adaptive_beta = adaptive_alpha if adaptive_alpha is not None else 0.1
         self.adaptive_beta = adaptive_beta
         self.adaptive_alpha = adaptive_beta
+        self.use_adaptive_d_value = use_adaptive_d_value
+        self.adaptive_d_warmup_only = adaptive_d_warmup_only
+        self.adaptive_d_warmup_iterations = adaptive_d_warmup_iterations
         self.cost_value_loss_coef = cost_value_loss_coef
         self.cost_viol_loss_coef = cost_viol_loss_coef
         
@@ -75,6 +85,17 @@ class NP3O(PPO):
 
     def _evaluate_cost(self, critic_obs, **kwargs):
         return self.actor_critic.evaluate_cost(critic_obs, **kwargs)
+
+    def _should_use_adaptive_d_value(self):
+        if not self.use_adaptive_d_value:
+            return False
+        if not self.adaptive_d_warmup_only:
+            return True
+
+        warmup_iterations = self.adaptive_d_warmup_iterations
+        if warmup_iterations is None:
+            warmup_iterations = self.k_warmup_iterations
+        return getattr(self, "current_learning_iteration", 0) < warmup_iterations
 
     def _bootstrap_timeout_costs(self, costs, infos, bootstrap_obs):
         if "time_outs" not in infos or bootstrap_obs is None:
@@ -323,6 +344,10 @@ class NP3O(PPO):
         target_d = self.storage.target_cost_d_values
         if target_d is None:
             return None
+
+        if not self._should_use_adaptive_d_value():
+            self.storage.update_active_d_values(target_d)
+            return target_d
         
         # Ensure tensors are on same device
         if current_cost_returns.device != target_d.device:

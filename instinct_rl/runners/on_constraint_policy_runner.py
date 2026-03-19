@@ -72,9 +72,8 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
             else getattr(algorithms, alg_class_name)
         )
         
-        # Check for k_value in env if needed by algorithm
-        if hasattr(self.env, 'cost_k_values'):
-            self.alg_cfg['k_value'] = self.env.cost_k_values
+        # If the config did not explicitly set the initial k_value, allow the env to provide it.
+        self._configure_initial_k_value()
              
         self.alg = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
@@ -155,6 +154,15 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         if cost_shape is not None:
             return torch.zeros(cost_shape, device=self.device)
         return None
+
+    def _configure_initial_k_value(self):
+        """Prefer explicitly configured k_value over environment-provided defaults."""
+        if self.alg_cfg.get("initial_k_value", None) is not None:
+            return
+        if self.alg_cfg.get("k_value", None) is not None:
+            return
+        if hasattr(self.env, "cost_k_values"):
+            self.alg_cfg["k_value"] = self.env.cost_k_values
 
     def _extract_costs(self, infos):
         """Extract costs from environment infos dict."""
@@ -312,6 +320,7 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
                 self.alg.compute_returns(critic_input)
                 
                 self.alg.compute_cost_returns(critic_input)
+                self.alg.current_learning_iteration = self.current_learning_iteration
 
                 # --- Adaptive Threshold Update (Kim et al. 2024) ---
                 # Use rollout cost returns instead of per-step costs so thresholds
