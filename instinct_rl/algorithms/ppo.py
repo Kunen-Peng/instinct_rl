@@ -334,8 +334,8 @@ class PPO:
 
         return state_dict
 
-    def load_state_dict(self, state_dict):
-        self.actor_critic.load_state_dict(state_dict["model_state_dict"])
+    def load_state_dict(self, state_dict, strict: bool = True):
+        self.actor_critic.load_state_dict(state_dict["model_state_dict"], strict=strict)
         if "optimizer_state_dict" in state_dict:
             self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
         if hasattr(self, "lr_scheduler"):

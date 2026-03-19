@@ -440,10 +440,10 @@ class NP3O(PPO):
         state["k_value"] = self.k_value
         return state
     
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, strict: bool = True):
         """Load algorithm state including k_value."""
         if "k_value" in state_dict:
             self.k_value = state_dict.pop("k_value")
             if isinstance(self.k_value, torch.Tensor):
                 self.k_value = self.k_value.to(self.device)
-        super().load_state_dict(state_dict)
+        super().load_state_dict(state_dict, strict=strict)
