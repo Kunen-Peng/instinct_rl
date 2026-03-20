@@ -83,6 +83,10 @@ class OnPolicyRunner:
                 "use_mirror_consistency_loss", False
             )
             self.alg_cfg["symmetry_loss_coef"] = self.symmetry_cfg.get("mirror_consistency_loss_coef", 0.0)
+            self.alg_cfg["symmetry_warn_large_init_scale"] = self.symmetry_cfg.get("warn_large_init_scale", True)
+            self.alg_cfg["symmetry_large_init_std_threshold"] = self.symmetry_cfg.get(
+                "large_init_std_threshold", 1.0
+            )
         self.alg: algorithms.PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
