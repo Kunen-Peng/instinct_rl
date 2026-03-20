@@ -58,6 +58,7 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.symmetry_cfg = train_cfg.get("symmetry", None)
 
         obs_format = env.get_obs_format()
 
@@ -71,6 +72,17 @@ class OnPolicyRunner:
 
         alg_class_name = self.alg_cfg.pop("class_name")
         alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algorithms, alg_class_name)
+        if alg_class_name == "SymmetryPPO":
+            if self.symmetry_cfg is None or not self.symmetry_cfg.get("enabled", False):
+                raise ValueError("SymmetryPPO requires symmetry.enabled=True in the runner config.")
+            self.alg_cfg["symmetry_helper_class_name"] = self.symmetry_cfg["helper_class_name"]
+            self.alg_cfg["symmetry_use_critic_augmentation"] = self.symmetry_cfg.get(
+                "use_critic_augmentation", False
+            )
+            self.alg_cfg["symmetry_use_mirror_consistency_loss"] = self.symmetry_cfg.get(
+                "use_mirror_consistency_loss", False
+            )
+            self.alg_cfg["symmetry_loss_coef"] = self.symmetry_cfg.get("mirror_consistency_loss_coef", 0.0)
         self.alg: algorithms.PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
