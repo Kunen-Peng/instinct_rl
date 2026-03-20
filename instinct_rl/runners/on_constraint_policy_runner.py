@@ -116,6 +116,7 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         self._cost_buffer = deque(maxlen=100)
         self._mean_cost_return = None
         self._mean_discounted_cost_violation = None
+        self.cost_term_names = self._get_cost_term_names()
 
         _, _ = self.env.reset()
 
@@ -124,6 +125,14 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         # Direct attribute (check value is not None)
         if hasattr(self.env, 'cost_shape') and self.env.cost_shape is not None:
             return self.env.cost_shape
+
+        # Wrapped environment may only expose cost metadata on the base env.
+        if hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'cost_shape'):
+            try:
+                if self.env.unwrapped.cost_shape is not None:
+                    return self.env.unwrapped.cost_shape
+            except Exception:
+                pass
             
         # From cost manager
         if hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'cost_manager'):
@@ -149,11 +158,40 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         """Get cost limit/threshold values from environment."""
         if hasattr(self.env, 'cost_d_values') and self.env.cost_d_values is not None:
             return self.env.cost_d_values
+
+        # Wrapped environments may keep cost limits only on the unwrapped base env.
+        if hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'cost_d_values'):
+            try:
+                if self.env.unwrapped.cost_d_values is not None:
+                    return self.env.unwrapped.cost_d_values
+            except Exception:
+                pass
             
         # Default to zeros if not provided
         if cost_shape is not None:
             return torch.zeros(cost_shape, device=self.device)
         return None
+
+    def _get_cost_term_names(self):
+        """Get ordered cost term names matching the cost vector indices."""
+        if hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'cost_manager'):
+            try:
+                active_terms = list(self.env.unwrapped.cost_manager.active_terms)
+                if active_terms:
+                    return active_terms
+            except Exception:
+                pass
+
+        if hasattr(self.env, 'cfg'):
+            try:
+                if isinstance(self.env.cfg, dict) and "costs" in self.env.cfg:
+                    return [name for name, cfg in self.env.cfg["costs"].items() if cfg is not None]
+                elif hasattr(self.env.cfg, "costs"):
+                    return [name for name, cfg in self.env.cfg.costs.__dict__.items() if not name.startswith("_") and cfg is not None]
+            except Exception:
+                pass
+
+        return []
 
     def _configure_initial_k_value(self):
         """Prefer explicitly configured k_value over environment-provided defaults."""
@@ -371,19 +409,21 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
 
             if self._mean_cost_return is not None:
                 for i in range(len(self._mean_cost_return)):
-                    self.writer_mp_add_scalar(
-                        f"Train/cost_{i}_mean_return",
-                        self._mean_cost_return[i].item(),
-                        self.current_learning_iteration,
-                    )
+                    if i < len(self.cost_term_names):
+                        self.writer_mp_add_scalar(
+                            f"Train/cost_{self.cost_term_names[i]}_mean_return",
+                            self._mean_cost_return[i].item(),
+                            self.current_learning_iteration,
+                        )
 
             if self._mean_discounted_cost_violation is not None:
                 for i in range(len(self._mean_discounted_cost_violation)):
-                    self.writer_mp_add_scalar(
-                        f"Train/cost_{i}_mean_discounted_violation_level",
-                        self._mean_discounted_cost_violation[i].item(),
-                        self.current_learning_iteration,
-                    )
+                    if i < len(self.cost_term_names):
+                        self.writer_mp_add_scalar(
+                            f"Train/cost_{self.cost_term_names[i]}_mean_discounted_violation_level",
+                            self._mean_discounted_cost_violation[i].item(),
+                            self.current_learning_iteration,
+                        )
             
             # Log k_value if available
             if hasattr(self.alg, 'k_value'):
@@ -406,14 +446,16 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
                 target_d = self.alg.storage.target_cost_d_values
                 if active_d is not None:
                     for i in range(len(active_d)):
-                        self.writer_mp_add_scalar(
-                            f'AdaptiveThreshold/cost_{i}_active',
-                            active_d[i].item(),
-                            self.current_learning_iteration
-                        )
-                        if target_d is not None:
+                        if i < len(self.cost_term_names):
                             self.writer_mp_add_scalar(
-                                f'AdaptiveThreshold/cost_{i}_target',
-                                target_d[i].item(),
+                                f'AdaptiveThreshold/{self.cost_term_names[i]}_active',
+                                active_d[i].item(),
                                 self.current_learning_iteration
                             )
+                        if target_d is not None:
+                            if i < len(self.cost_term_names):
+                                self.writer_mp_add_scalar(
+                                    f'AdaptiveThreshold/{self.cost_term_names[i]}_target',
+                                    target_d[i].item(),
+                                    self.current_learning_iteration
+                                )
