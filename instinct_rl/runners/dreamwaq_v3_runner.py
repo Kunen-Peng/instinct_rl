@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from tensorboardX import SummaryWriter
 
-from instinct_rl.algorithms.dreamwaq_v3 import PPODreamWaQRecurrentV3
+from instinct_rl.algorithms.dreamwaq_v3 import PPODreamWaQRecurrentV3, PPODreamWaQRecurrentV3SGMA
 from instinct_rl.modules.cenet_v3 import CENetV3 as CENet
 from instinct_rl.runners.dreamwaq_v2_runner import DreamWaQRecurrentRunnerV2
 from instinct_rl.utils.utils import store_code_state
@@ -240,6 +240,57 @@ class DreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV2):
             opset_version=12,
         )
         print(f"DreamWaQ V3 recurrent policy exported to {export_path}")
+
+    def _build_symmetry_helper(self, helper_class_name: str):
+        module_name, class_name = helper_class_name.rsplit(":", 1)
+        module = __import__(module_name, fromlist=[class_name])
+        helper_cls = getattr(module, class_name)
+        helper_kwargs = {}
+        encoder = getattr(self.cenet, "encoder", self.cenet)
+        if hasattr(encoder, "num_history_steps"):
+            helper_kwargs["history_length"] = encoder.num_history_steps
+        if hasattr(encoder, "obs_layout"):
+            helper_kwargs["obs_layout"] = encoder.obs_layout
+        return helper_cls(self.env.get_obs_format(), **helper_kwargs)
+
+
+class SGMADreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV3):
+    """DreamWaQ v3 runner with SGMA-style offline symmetry augmentation."""
+
+    def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
+        super().__init__(env, train_cfg, log_dir=log_dir, device=device)
+        self.symmetry_cfg = train_cfg.get("symmetry", None)
+        if self.symmetry_cfg is None or not self.symmetry_cfg.get("enabled", False):
+            raise ValueError("SGMADreamWaQRecurrentRunnerV3 requires symmetry.enabled=True in the runner config.")
+
+        self.symmetry_helper = self._build_symmetry_helper(self.symmetry_cfg["helper_class_name"])
+
+        alg_kwargs = self.alg_cfg.copy()
+        alg_kwargs.pop("class_name", None)
+        actor_critic = self.alg.actor_critic
+        self.alg = PPODreamWaQRecurrentV3SGMA(
+            actor_critic,
+            self.cenet,
+            device=self.device,
+            symmetry_helper_class_name=self.symmetry_cfg["helper_class_name"],
+            **alg_kwargs,
+        )
+        obs_format = self.env.get_obs_format()
+        obs_format["policy"]["estimator"] = (self.cenet.latent_dim,)
+        self.alg.init_storage(
+            self.env.num_envs,
+            self.num_steps_per_env,
+            obs_format,
+            self.env.num_actions,
+            self.env.num_rewards,
+            num_single_obs=getattr(self.env, "num_single_obs", self.cfg.get("num_single_obs")),
+        )
+        self.alg.configure_sgma(
+            self.env.get_obs_format(),
+            self.symmetry_cfg["helper_class_name"],
+            policy_normalizer=self.normalizers.get("policy"),
+            critic_normalizer=self.normalizers.get("critic"),
+        )
 
 
 class SymmetryDreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV3):

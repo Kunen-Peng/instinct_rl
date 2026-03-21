@@ -17,6 +17,8 @@ class RolloutStorage:
         def __init__(self):
             self.observations = None
             self.critic_observations = None
+            self.raw_observations = None
+            self.raw_critic_observations = None
             self.actions = None
             self.rewards = None
             self.dones = None
@@ -34,6 +36,8 @@ class RolloutStorage:
         [
             "obs",
             "critic_obs",
+            "raw_obs",
+            "raw_critic_obs",
             "actions",
             "values",
             "advantages",
@@ -58,12 +62,17 @@ class RolloutStorage:
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        self.raw_observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
         if critic_obs_shape[0] is not None:
             self.critic_observations = torch.zeros(
                 num_transitions_per_env, num_envs, *critic_obs_shape, device=self.device
             )
+            self.raw_critic_observations = torch.zeros(
+                num_transitions_per_env, num_envs, *critic_obs_shape, device=self.device
+            )
         else:
             self.critic_observations = None
+            self.raw_critic_observations = None
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, num_rewards, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -88,8 +97,16 @@ class RolloutStorage:
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
         self.observations[self.step].copy_(transition.observations)
+        raw_observations = transition.raw_observations if transition.raw_observations is not None else transition.observations
+        self.raw_observations[self.step].copy_(raw_observations)
         if self.critic_observations is not None:
             self.critic_observations[self.step].copy_(transition.critic_observations)
+            raw_critic_observations = (
+                transition.raw_critic_observations
+                if transition.raw_critic_observations is not None
+                else transition.critic_observations
+            )
+            self.raw_critic_observations[self.step].copy_(raw_critic_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, self.num_rewards))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -167,8 +184,13 @@ class RolloutStorage:
         self._padded_obs_trajectories, self._trajectory_masks = split_and_pad_trajectories(
             self.observations, self.dones
         )
+        self._padded_raw_obs_trajectories, _ = split_and_pad_trajectories(self.raw_observations, self.dones)
         if self.critic_observations is not None:
             self._padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.critic_observations, self.dones)
+        if self.raw_critic_observations is not None:
+            self._padded_raw_critic_obs_trajectories, _ = split_and_pad_trajectories(
+                self.raw_critic_observations, self.dones
+            )
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -206,18 +228,29 @@ class RolloutStorage:
         """
         if padded_B_slice is None:
             obs_batch = self.observations[T_select, B_select]
+            raw_obs_batch = self.raw_observations[T_select, B_select]
             critic_obs_batch = (
                 obs_batch if self.critic_observations is None else self.critic_observations[T_select, B_select]
+            )
+            raw_critic_obs_batch = (
+                raw_obs_batch
+                if self.raw_critic_observations is None
+                else self.raw_critic_observations[T_select, B_select]
             )
             hid_batch = None
             obs_mask_batch = None
         else:
             obs_batch = self._padded_obs_trajectories[T_select, padded_B_slice]
+            raw_obs_batch = self._padded_raw_obs_trajectories[T_select, padded_B_slice]
             critic_obs_batch = (
                 obs_batch
                 if self.critic_observations is None
                 else self._padded_critic_obs_trajectories[T_select, padded_B_slice]
             )
+            if self.raw_critic_observations is None:
+                raw_critic_obs_batch = raw_obs_batch
+            else:
+                raw_critic_obs_batch = self._padded_raw_critic_obs_trajectories[T_select, padded_B_slice]
 
             # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
             # then take only time steps after dones (flattens num envs and time dimensions),
@@ -245,6 +278,8 @@ class RolloutStorage:
         return RolloutStorage.MiniBatch(
             obs_batch,
             critic_obs_batch,
+            raw_obs_batch,
+            raw_critic_obs_batch,
             action_batch,
             target_value_batch,
             advantage_batch,
@@ -300,10 +335,24 @@ class QueueRolloutStorage(RolloutStorage):
             ],
             dim=0,
         ).contiguous()
+        self.raw_observations = torch.cat(
+            [
+                self.raw_observations,
+                torch.zeros(expand_size, self.num_envs, *self.obs_shape, device=self.device),
+            ],
+            dim=0,
+        ).contiguous()
         if self.critic_obs_shape[0] is not None:
             self.critic_observations = torch.cat(
                 [
                     self.critic_observations,
+                    torch.zeros(expand_size, self.num_envs, *self.critic_obs_shape, device=self.device),
+                ],
+                dim=0,
+            ).contiguous()
+            self.raw_critic_observations = torch.cat(
+                [
+                    self.raw_critic_observations,
                     torch.zeros(expand_size, self.num_envs, *self.critic_obs_shape, device=self.device),
                 ],
                 dim=0,
@@ -420,8 +469,10 @@ class QueueRolloutStorage(RolloutStorage):
 
     def untie_buffer_loop(self):
         self.observations = self.swap_from_cursor(self.observations)
+        self.raw_observations = self.swap_from_cursor(self.raw_observations)
         if self.critic_observations is not None:
             self.critic_observations = self.swap_from_cursor(self.critic_observations)
+            self.raw_critic_observations = self.swap_from_cursor(self.raw_critic_observations)
         self.actions = self.swap_from_cursor(self.actions)
         self.rewards = self.swap_from_cursor(self.rewards)
         self.dones = self.swap_from_cursor(self.dones)

@@ -123,6 +123,8 @@ class OnPolicyRunner:
         self.git_status_repos = [instinct_rl.__file__]  # store files whose repo status will be logged.
 
         _, _ = self.env.reset()
+        if alg_class_name == "SymmetryPPO" and hasattr(self.alg, "configure_normalizers"):
+            self.alg.configure_normalizers(self.normalizers.get("policy"), self.normalizers.get("critic"))
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         # Must call distributed_data_parallel after load_run (in train.py). Otherwise, a DDP algo cannot
@@ -138,9 +140,10 @@ class OnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
         obs, extras = self.env.get_observations()
-        obs = obs.to(self.device)
-        critic_obs = extras["observations"].get("critic", None)
-        critic_obs = critic_obs.to(self.device) if critic_obs is not None else None
+        raw_obs = obs.to(self.device)
+        raw_critic_obs = extras["observations"].get("critic", None)
+        raw_critic_obs = raw_critic_obs.to(self.device) if raw_critic_obs is not None else None
+        obs, critic_obs = self._normalize_policy_observations(raw_obs, raw_critic_obs)
         self.train_mode()
 
         ep_infos = []
@@ -170,7 +173,9 @@ class OnPolicyRunner:
             # Rollout
             with torch.inference_mode(self.cfg.get("inference_mode_rollout", True)):
                 for i in range(self.num_steps_per_env):
-                    obs, critic_obs, rewards, dones, infos = self.rollout_step(obs, critic_obs)
+                    obs, critic_obs, raw_obs, raw_critic_obs, rewards, dones, infos = self.rollout_step(
+                        obs, critic_obs, raw_obs, raw_critic_obs
+                    )
                     if len(rewards.shape) == 1:
                         rewards = rewards.unsqueeze(-1)
 
@@ -214,16 +219,32 @@ class OnPolicyRunner:
 
         self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-    def rollout_step(self, obs, critic_obs):
-        actions = self.alg.act(obs, critic_obs)
-        obs, rewards, dones, infos = self.env.step(actions)
-        critic_obs = infos["observations"].get("critic", None)
-        obs, critic_obs, rewards, dones = (
-            obs.to(self.device),
-            critic_obs.to(self.device) if critic_obs is not None else None,
+    def _normalize_policy_observations(self, obs: torch.Tensor, critic_obs: torch.Tensor | None):
+        obs = obs.clone()
+        critic_obs = critic_obs.clone() if critic_obs is not None else None
+        for obs_group_name, normalizer in self.normalizers.items():
+            if obs_group_name == "policy":
+                obs = normalizer(obs)
+            elif obs_group_name == "critic":
+                critic_obs = normalizer(critic_obs)
+        return obs, critic_obs
+
+    def rollout_step(self, obs, critic_obs, raw_obs=None, raw_critic_obs=None):
+        raw_obs = raw_obs if raw_obs is not None else obs
+        raw_critic_obs = raw_critic_obs if raw_critic_obs is not None else critic_obs
+        if hasattr(self.alg, "configure_normalizers"):
+            actions = self.alg.act(obs, critic_obs, raw_obs=raw_obs, raw_critic_obs=raw_critic_obs)
+        else:
+            actions = self.alg.act(obs, critic_obs)
+        next_obs, rewards, dones, infos = self.env.step(actions)
+        next_critic_obs = infos["observations"].get("critic", None)
+        next_raw_obs, next_raw_critic_obs, rewards, dones = (
+            next_obs.to(self.device),
+            next_critic_obs.to(self.device) if next_critic_obs is not None else None,
             rewards.to(self.device),
             dones.to(self.device),
         )
+        obs, critic_obs = next_raw_obs, next_raw_critic_obs
         # Dealing with obs normalizers. At this line, obs and critic_obs and all observations in info are still flattened
         for obs_group_name, normalizer in self.normalizers.items():
             if obs_group_name == "policy":
@@ -236,7 +257,7 @@ class OnPolicyRunner:
             else:
                 infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
         self.alg.process_env_step(rewards, dones, infos, obs, critic_obs)
-        return obs, critic_obs, rewards, dones, infos
+        return obs, critic_obs, next_raw_obs, next_raw_critic_obs, rewards, dones, infos
 
     """
     Logging

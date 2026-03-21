@@ -134,7 +134,7 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, critic_obs, raw_obs=None, raw_critic_obs=None):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values
@@ -146,6 +146,8 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
+        self.transition.raw_observations = raw_obs
+        self.transition.raw_critic_observations = raw_critic_obs
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs, next_critic_obs_for_bootstrap=None):

@@ -43,6 +43,8 @@ class SymmetryPPO(PPO):
         self.symmetry_warn_large_init_scale = symmetry_warn_large_init_scale
         self.symmetry_large_init_std_threshold = symmetry_large_init_std_threshold
         self.symmetry_helper = self._build_symmetry_helper(symmetry_helper_class_name)
+        self.policy_normalizer = None
+        self.critic_normalizer = None
         self._warn_if_large_initialization_scale()
 
     def _build_symmetry_helper(self, helper_class_name: str):
@@ -64,6 +66,15 @@ class SymmetryPPO(PPO):
         else:
             value_loss = (value_returns - value_batch).pow(2)
         return value_loss.reshape(-1, value_loss.shape[-1]).mean(dim=0)
+
+    def configure_normalizers(self, policy_normalizer=None, critic_normalizer=None):
+        self.policy_normalizer = policy_normalizer
+        self.critic_normalizer = critic_normalizer
+
+    def _apply_normalizer(self, normalizer, observations: torch.Tensor | None) -> torch.Tensor | None:
+        if observations is None or normalizer is None:
+            return observations
+        return normalizer(observations)
 
     def _policy_mean(self, observations: torch.Tensor) -> torch.Tensor:
         self.actor_critic.update_distribution(observations)
@@ -138,8 +149,13 @@ class SymmetryPPO(PPO):
 
         value_loss = self._compute_value_loss(value_batch, minibatch.values, minibatch.returns)
 
-        obs_aug = self.symmetry_helper.mirror_group("policy", minibatch.obs)
-        critic_obs_aug = self.symmetry_helper.mirror_group("critic", minibatch.critic_obs)
+        raw_obs = minibatch.raw_obs if minibatch.raw_obs is not None else minibatch.obs
+        raw_critic_obs = minibatch.raw_critic_obs if minibatch.raw_critic_obs is not None else minibatch.critic_obs
+
+        obs_aug = self.symmetry_helper.mirror_group("policy", raw_obs)
+        obs_aug = self._apply_normalizer(self.policy_normalizer, obs_aug)
+        critic_obs_aug = self.symmetry_helper.mirror_group("critic", raw_critic_obs)
+        critic_obs_aug = self._apply_normalizer(self.critic_normalizer, critic_obs_aug)
         actions_aug = self.symmetry_helper.mirror_actions(minibatch.actions)
 
         self.actor_critic.update_distribution(obs_aug)

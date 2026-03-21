@@ -17,8 +17,45 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
         "MiniBatch",
         [
             *RolloutStorageDreamWaQRecurrent.MiniBatch._fields,
+            "aug_obs",
+            "aug_critic_obs",
+            "aug_actions",
+            "aug_old_actions_log_prob",
+            "aug_returns",
+            "aug_advantages",
         ],
     )
+
+    def clear(self):
+        super().clear()
+        self.clear_sgma_augmentation()
+
+    def clear_sgma_augmentation(self):
+        self.aug_observations = None
+        self.aug_critic_observations = None
+        self.aug_actions = None
+        self.aug_old_actions_log_prob = None
+        self.aug_returns = None
+        self.aug_advantages = None
+
+    def set_sgma_augmentation(
+        self,
+        aug_observations,
+        aug_critic_observations,
+        aug_actions,
+        aug_old_actions_log_prob,
+        aug_returns,
+        aug_advantages,
+    ):
+        self.aug_observations = aug_observations
+        self.aug_critic_observations = aug_critic_observations
+        self.aug_actions = aug_actions
+        self.aug_old_actions_log_prob = aug_old_actions_log_prob
+        self.aug_returns = aug_returns
+        self.aug_advantages = aug_advantages
+
+    def get_direct_policy_obs_sequences(self, raw_encoder_input_dim):
+        return self.observations[..., :raw_encoder_input_dim]
 
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
         self._padded_obs_trajectories, self._trajectory_masks = split_and_pad_trajectories(
@@ -62,7 +99,27 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
 
     def get_minibatch_from_selection(self, T_select, B_select, padded_B_slice=None, prev_done_mask=None):
         if padded_B_slice is None:
-            return super().get_minibatch_from_selection(T_select, B_select, padded_B_slice, prev_done_mask)
+            minibatch = super().get_minibatch_from_selection(T_select, B_select, padded_B_slice, prev_done_mask)
+            aug_obs_batch = self.aug_observations[T_select, B_select] if self.aug_observations is not None else None
+            if self.aug_critic_observations is not None:
+                aug_critic_obs_batch = self.aug_critic_observations[T_select, B_select]
+            else:
+                aug_critic_obs_batch = None
+            aug_actions_batch = self.aug_actions[T_select, B_select] if self.aug_actions is not None else None
+            aug_old_actions_log_prob_batch = (
+                self.aug_old_actions_log_prob[T_select, B_select] if self.aug_old_actions_log_prob is not None else None
+            )
+            aug_returns_batch = self.aug_returns[T_select, B_select] if self.aug_returns is not None else None
+            aug_advantages_batch = self.aug_advantages[T_select, B_select] if self.aug_advantages is not None else None
+            return RolloutStorageDreamWaQRecurrentV3.MiniBatch(
+                *minibatch,
+                aug_obs_batch,
+                aug_critic_obs_batch,
+                aug_actions_batch,
+                aug_old_actions_log_prob_batch,
+                aug_returns_batch,
+                aug_advantages_batch,
+            )
 
         obs_batch = self._padded_obs_trajectories[T_select, padded_B_slice]
         critic_obs_batch = (
@@ -95,6 +152,17 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
         advantage_batch = self.advantages[T_select, B_select]
         old_mu_batch = self.mu[T_select, B_select]
         old_sigma_batch = self.sigma[T_select, B_select]
+        aug_obs_batch = self.aug_observations[T_select, B_select] if self.aug_observations is not None else None
+        if self.aug_critic_observations is not None:
+            aug_critic_obs_batch = self.aug_critic_observations[T_select, B_select]
+        else:
+            aug_critic_obs_batch = None
+        aug_actions_batch = self.aug_actions[T_select, B_select] if self.aug_actions is not None else None
+        aug_old_actions_log_prob_batch = (
+            self.aug_old_actions_log_prob[T_select, B_select] if self.aug_old_actions_log_prob is not None else None
+        )
+        aug_returns_batch = self.aug_returns[T_select, B_select] if self.aug_returns is not None else None
+        aug_advantages_batch = self.aug_advantages[T_select, B_select] if self.aug_advantages is not None else None
 
         return RolloutStorageDreamWaQRecurrentV3.MiniBatch(
             obs_batch,
@@ -111,6 +179,12 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
             single_obs_batch,
             dones_batch,
             cenet_hidden_states_batch,
+            aug_obs_batch,
+            aug_critic_obs_batch,
+            aug_actions_batch,
+            aug_old_actions_log_prob_batch,
+            aug_returns_batch,
+            aug_advantages_batch,
         )
 
 
@@ -209,3 +283,142 @@ class PPODreamWaQRecurrentV3(PPODreamWaQRecurrentCommon):
                 accumulators["loss_est"] += cenet_loss
 
         return self._finalize_update(accumulators)
+
+
+class PPODreamWaQRecurrentV3SGMA(PPODreamWaQRecurrentV3):
+    def __init__(self, *args, symmetry_helper_class_name: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if symmetry_helper_class_name is None:
+            raise ValueError("PPODreamWaQRecurrentV3SGMA requires symmetry_helper_class_name.")
+        self.symmetry_helper_class_name = symmetry_helper_class_name
+        self.symmetry_helper = None
+        self.policy_normalizer = None
+        self.critic_normalizer = None
+        self.aug_cenet_hidden_states = None
+
+    def configure_sgma(self, obs_format, symmetry_helper_class_name, policy_normalizer=None, critic_normalizer=None):
+        module_name, class_name = symmetry_helper_class_name.rsplit(":", 1)
+        module = __import__(module_name, fromlist=[class_name])
+        helper_cls = getattr(module, class_name)
+        helper_kwargs = {}
+        encoder = getattr(self.cenet, "encoder", self.cenet)
+        if hasattr(encoder, "num_history_steps"):
+            helper_kwargs["history_length"] = encoder.num_history_steps
+        if hasattr(encoder, "obs_layout"):
+            helper_kwargs["obs_layout"] = encoder.obs_layout
+        self.symmetry_helper = helper_cls(obs_format, **helper_kwargs)
+        self.policy_normalizer = policy_normalizer
+        self.critic_normalizer = critic_normalizer
+        self.aug_cenet_hidden_states = torch.zeros(
+            self.cenet.rnn.num_layers,
+            self.storage.num_envs,
+            self.cenet.rnn.hidden_size,
+            device=self.device,
+        )
+
+    def _apply_normalizer(self, normalizer, tensor):
+        if normalizer is None or tensor is None:
+            return tensor
+        original_shape = tensor.shape
+        normalized = normalizer(tensor.reshape(-1, original_shape[-1]))
+        return normalized.reshape(original_shape)
+
+    def _build_offline_augmented_rollout(self):
+        if self.symmetry_helper is None:
+            raise ValueError("SGMA symmetry helper is not configured.")
+
+        raw_obs = self.storage.get_direct_policy_obs_sequences(self.cenet.raw_encoder_input_dim)
+        critic_obs = self.storage.critic_observations
+        aug_raw_obs = self.symmetry_helper.mirror_group("policy", raw_obs)
+        aug_raw_obs = self._apply_normalizer(self.policy_normalizer, aug_raw_obs)
+
+        aug_critic_obs = None
+        if critic_obs is not None:
+            aug_critic_obs = self.symmetry_helper.mirror_group("critic", critic_obs)
+            aug_critic_obs = self._apply_normalizer(self.critic_normalizer, aug_critic_obs)
+
+        aug_actions = self.symmetry_helper.mirror_actions(self.storage.actions)
+
+        sequence_masks = torch.ones(
+            self.storage.num_transitions_per_env,
+            self.storage.num_envs,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        aug_estimates = self.cenet.encode(
+            aug_raw_obs,
+            hidden_states=self.aug_cenet_hidden_states,
+            masks=sequence_masks,
+        ).detach()
+
+        hidden_states = self.aug_cenet_hidden_states.clone()
+        aug_latents = torch.zeros(
+            self.storage.num_transitions_per_env,
+            self.storage.num_envs,
+            self.cenet.latent_dim,
+            device=self.device,
+        )
+        for step in range(self.storage.num_transitions_per_env):
+            if step > 0:
+                done_ids = self.storage.dones[step - 1].view(-1).nonzero(as_tuple=False).squeeze(-1)
+                if len(done_ids) > 0:
+                    hidden_states[:, done_ids] = 0.0
+
+            estimate = aug_estimates[step]
+            if self.use_estimate:
+                final_estimate = estimate.detach()
+            else:
+                critic_for_vel = aug_critic_obs[step] if aug_critic_obs is not None else aug_raw_obs[step]
+                lin_vel = get_subobs_by_components(
+                    critic_for_vel,
+                    ["base_lin_vel"],
+                    self.actor_critic.critic_obs_segments,
+                )
+                final_estimate = torch.cat([lin_vel.detach(), estimate[:, 3:].detach()], dim=-1)
+
+            aug_latents[step] = final_estimate
+            _, hidden_states = self.cenet.encoder_inference_recurrent(aug_raw_obs[step], hidden_states)
+            hidden_states = hidden_states.detach()
+
+        done_ids = self.storage.dones[-1].view(-1).nonzero(as_tuple=False).squeeze(-1)
+        if len(done_ids) > 0:
+            hidden_states[:, done_ids] = 0.0
+        self.aug_cenet_hidden_states = hidden_states.detach()
+
+        aug_obs = torch.cat([aug_raw_obs, aug_latents], dim=-1)
+        self.storage.set_sgma_augmentation(
+            aug_observations=aug_obs,
+            aug_critic_observations=aug_critic_obs,
+            aug_actions=aug_actions,
+            aug_old_actions_log_prob=self.storage.actions_log_prob.clone(),
+            aug_returns=self.storage.returns.clone(),
+            aug_advantages=self.storage.advantages.clone(),
+        )
+
+    def compute_losses(self, minibatch):
+        losses, inter_vars, stats = super().compute_losses(minibatch)
+        if minibatch.aug_obs is None:
+            return losses, inter_vars, stats
+
+        self.actor_critic.act(minibatch.aug_obs)
+        aug_log_prob = self.actor_critic.get_actions_log_prob(minibatch.aug_actions)
+        old_aug_log_prob = minibatch.aug_old_actions_log_prob.squeeze(-1)
+        mixed_advantages = torch.mean(minibatch.aug_advantages * self.advantage_mixing_weights, dim=-1)
+        aug_ratio = torch.exp(aug_log_prob - old_aug_log_prob)
+        aug_surrogate = -mixed_advantages * aug_ratio
+        aug_surrogate_clipped = -mixed_advantages * torch.clamp(
+            aug_ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+        )
+        aug_surrogate_loss = torch.max(aug_surrogate, aug_surrogate_clipped).mean()
+
+        losses["surrogate_loss"] = 0.5 * (losses["surrogate_loss"] + aug_surrogate_loss)
+        stats["sgma_ratio_mean"] = aug_ratio.detach().mean()
+        stats["sgma_surrogate_loss"] = aug_surrogate_loss.detach()
+        stats["sgma_action_mean_abs"] = self.actor_critic.action_mean.detach().abs().mean()
+        return losses, inter_vars, stats
+
+    def update(self, current_learning_iteration):
+        self._build_offline_augmented_rollout()
+        losses, stats = super().update(current_learning_iteration)
+        self.storage.clear_sgma_augmentation()
+        return losses, stats
