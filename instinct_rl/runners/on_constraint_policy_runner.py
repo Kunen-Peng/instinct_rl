@@ -46,6 +46,7 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.symmetry_cfg = train_cfg.get("symmetry", None)
 
         obs_format = env.get_obs_format()
 
@@ -66,11 +67,27 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
 
         # Build algorithm
         alg_class_name = self.alg_cfg.pop("class_name")
-        alg_class = (
-            importlib.import_module(alg_class_name) 
-            if ":" in alg_class_name 
-            else getattr(algorithms, alg_class_name)
-        )
+        if ":" in alg_class_name:
+            module_name, class_name = alg_class_name.rsplit(":", 1)
+            alg_class = getattr(importlib.import_module(module_name), class_name)
+        else:
+            alg_class = getattr(algorithms, alg_class_name)
+
+        if alg_class_name == "SymmetryNP3O":
+            if self.symmetry_cfg is None or not self.symmetry_cfg.get("enabled", False):
+                raise ValueError("SymmetryNP3O requires symmetry.enabled=True in the runner config.")
+            self.alg_cfg["symmetry_helper_class_name"] = self.symmetry_cfg["helper_class_name"]
+            self.alg_cfg["symmetry_use_critic_augmentation"] = self.symmetry_cfg.get(
+                "use_critic_augmentation", False
+            )
+            self.alg_cfg["symmetry_use_mirror_consistency_loss"] = self.symmetry_cfg.get(
+                "use_mirror_consistency_loss", False
+            )
+            self.alg_cfg["symmetry_loss_coef"] = self.symmetry_cfg.get("mirror_consistency_loss_coef", 0.0)
+            self.alg_cfg["symmetry_warn_large_init_scale"] = self.symmetry_cfg.get("warn_large_init_scale", True)
+            self.alg_cfg["symmetry_large_init_std_threshold"] = self.symmetry_cfg.get(
+                "large_init_std_threshold", 1.0
+            )
         
         # If the config did not explicitly set the initial k_value, allow the env to provide it.
         self._configure_initial_k_value()
@@ -119,6 +136,8 @@ class OnConstraintPolicyRunner(OnPolicyRunner):
         self.cost_term_names = self._get_cost_term_names()
 
         _, _ = self.env.reset()
+        if alg_class_name == "SymmetryNP3O" and hasattr(self.alg, "configure_normalizers"):
+            self.alg.configure_normalizers(self.normalizers.get("policy"), self.normalizers.get("critic"))
 
     def _get_cost_shape(self):
         """Get cost shape from environment."""
