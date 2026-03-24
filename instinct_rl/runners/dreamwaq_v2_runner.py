@@ -102,27 +102,31 @@ class DreamWaQRunnerV2(OnPolicyRunner):
         self.normalizers = {}
         # ... (Same as base, omitted for brevity, add if needed)
 
-    def rollout_step(self, obs, critic_obs):
+    def rollout_step(self, obs, critic_obs, raw_obs=None, raw_critic_obs=None):
         # We need to extract single_obs (last frame) from obs
         # obs shape: (num_envs, num_encoder_obs) where num_encoder_obs = history * single
         # single_obs = obs[..., -num_single_obs:]
-        num_single_obs = self.cenet.decoder.model[-1].out_features         
+        num_single_obs = self.cenet.decoder.model[-1].out_features
+        raw_obs = raw_obs if raw_obs is not None else obs
+        raw_critic_obs = raw_critic_obs if raw_critic_obs is not None else critic_obs
+
         # Act
         actions = self.alg.act(obs, critic_obs)
-        
+
         # Step
         next_obs, rewards, dones, infos = self.env.step(actions)
-        
+
         # Deal with next_critic_obs
         next_critic_obs = infos["observations"].get("critic", None)
-        
-        next_obs, next_critic_obs, rewards, dones = (
+
+        next_raw_obs, next_raw_critic_obs, rewards, dones = (
             next_obs.to(self.device),
             next_critic_obs.to(self.device) if next_critic_obs is not None else None,
             rewards.to(self.device),
             dones.to(self.device),
         )
-        
+        next_obs, next_critic_obs = next_raw_obs, next_raw_critic_obs
+
         # Apply Normalizers (Missing in previous implementation!)
         for obs_group_name, normalizer in self.normalizers.items():
             if obs_group_name == "policy":
@@ -135,7 +139,7 @@ class DreamWaQRunnerV2(OnPolicyRunner):
             else:
                 if obs_group_name in infos["observations"]:
                     infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
-                    
+
         # Apply normalization to termination_observations to avoid outlier explosion in loss
         if "termination_observations" in infos:
             term_obs = infos["termination_observations"]
@@ -147,17 +151,17 @@ class DreamWaQRunnerV2(OnPolicyRunner):
                 # If term_obs is a direct tensor and normalizers have 'critic', assuming we are predicting critic
                 if "critic" in self.normalizers:
                     infos["termination_observations"] = self.normalizers["critic"](term_obs)
-        
+
         # Rewards No Clip
         # DWL uses a separate buffer. We'll use the returned rewards or info['rewards_noClip'] if available.
-        rewards_noClip = infos.get("rewards_noClip", rewards) 
+        rewards_noClip = infos.get("rewards_noClip", rewards)
         if isinstance(rewards_noClip, torch.Tensor):
              rewards_noClip = rewards_noClip.to(self.device)
-        
+
         # Process
         self.alg.process_env_step(rewards, dones, infos, rewards_noClip, num_single_obs, next_obs, next_critic_obs)
-        
-        return next_obs, next_critic_obs, rewards, dones, infos
+
+        return next_obs, next_critic_obs, next_raw_obs, next_raw_critic_obs, rewards, dones, infos
 
     def save(self, path, infos=None):
         run_state_dict = self.alg.state_dict()
@@ -426,19 +430,21 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
             self.normalizers[obs_group_name] = normalizer
 
 
-    def rollout_step(self, obs, critic_obs):
-        num_single_obs = self.cenet.decoder.model[-1].out_features         
-        
+    def rollout_step(self, obs, critic_obs, raw_obs=None, raw_critic_obs=None):
+        num_single_obs = self.cenet.decoder.model[-1].out_features
+        raw_obs = raw_obs if raw_obs is not None else obs
+        raw_critic_obs = raw_critic_obs if raw_critic_obs is not None else critic_obs
+
         # Act with Recurrent State
         # self.alg.act is PPODreamWaQRecurrent.act
         # pass current cenet_hidden_states
         actions, next_cenet_hidden_states = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
-        
+
         self.cenet_hidden_states = next_cenet_hidden_states.detach()
 
         # Step Env
         next_obs, rewards, dones, infos = self.env.step(actions)
-        
+
         # Reset hidden states for done envs
         # next_cenet_hidden_states shape: (num_layers, num_envs, hidden)
         env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
@@ -446,14 +452,15 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
             self.cenet_hidden_states[:, env_ids_done] = 0.0
 
         next_critic_obs = infos["observations"].get("critic", None)
-        
-        next_obs, next_critic_obs, rewards, dones = (
+
+        next_raw_obs, next_raw_critic_obs, rewards, dones = (
             next_obs.to(self.device),
             next_critic_obs.to(self.device) if next_critic_obs is not None else None,
             rewards.to(self.device),
             dones.to(self.device),
         )
-        
+        next_obs, next_critic_obs = next_raw_obs, next_raw_critic_obs
+
         # Normalizers
         for obs_group_name, normalizer in self.normalizers.items():
             if obs_group_name == "policy":
@@ -466,7 +473,7 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
             else:
                 if obs_group_name in infos["observations"]:
                     infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
-                    
+
         # Apply normalization to termination_observations to avoid outlier explosion in loss
         if "termination_observations" in infos:
             term_obs = infos["termination_observations"]
@@ -478,14 +485,14 @@ class DreamWaQRecurrentRunnerV2(DreamWaQRunnerV2):
                 # If term_obs is a direct tensor and normalizers have 'critic', assuming we are predicting critic
                 if "critic" in self.normalizers:
                     infos["termination_observations"] = self.normalizers["critic"](term_obs)
-        
-        rewards_noClip = infos.get("rewards_noClip", rewards) 
+
+        rewards_noClip = infos.get("rewards_noClip", rewards)
         if isinstance(rewards_noClip, torch.Tensor):
              rewards_noClip = rewards_noClip.to(self.device)
-        
+
         self.alg.process_env_step(rewards, dones, infos, rewards_noClip, num_single_obs, next_obs, next_critic_obs)
-        
-        return next_obs, next_critic_obs, rewards, dones, infos
+
+        return next_obs, next_critic_obs, next_raw_obs, next_raw_critic_obs, rewards, dones, infos
 
     def get_inference_policy(self, device=None):
         self.eval_mode()

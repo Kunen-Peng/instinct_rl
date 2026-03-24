@@ -26,6 +26,31 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
         ],
     )
 
+    def __init__(
+        self,
+        num_envs,
+        num_transitions_per_env,
+        obs_shape,
+        critic_obs_shape,
+        actions_shape,
+        num_single_obs,
+        cenet_hidden_state_shape,
+        num_rewards=1,
+        device="cpu",
+    ):
+        super().__init__(
+            num_envs,
+            num_transitions_per_env,
+            obs_shape,
+            critic_obs_shape,
+            actions_shape,
+            num_single_obs,
+            cenet_hidden_state_shape,
+            num_rewards=num_rewards,
+            device=device,
+        )
+        self.clear_sgma_augmentation()
+
     def clear(self):
         super().clear()
         self.clear_sgma_augmentation()
@@ -61,8 +86,13 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
         self._padded_obs_trajectories, self._trajectory_masks = split_and_pad_trajectories(
             self.observations, self.dones
         )
+        self._padded_raw_obs_trajectories, _ = split_and_pad_trajectories(self.raw_observations, self.dones)
         if self.critic_observations is not None:
             self._padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.critic_observations, self.dones)
+        if self.raw_critic_observations is not None:
+            self._padded_raw_critic_obs_trajectories, _ = split_and_pad_trajectories(
+                self.raw_critic_observations, self.dones
+            )
         self._padded_single_obs_trajectories, _ = split_and_pad_trajectories(self.single_obs, self.dones)
         self._padded_dones_trajectories, _ = split_and_pad_trajectories(self.dones.float(), self.dones)
 
@@ -122,11 +152,16 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
             )
 
         obs_batch = self._padded_obs_trajectories[T_select, padded_B_slice]
+        raw_obs_batch = self._padded_raw_obs_trajectories[T_select, padded_B_slice]
         critic_obs_batch = (
             obs_batch
             if self.critic_observations is None
             else self._padded_critic_obs_trajectories[T_select, padded_B_slice]
         )
+        if self.raw_critic_observations is None:
+            raw_critic_obs_batch = raw_obs_batch
+        else:
+            raw_critic_obs_batch = self._padded_raw_critic_obs_trajectories[T_select, padded_B_slice]
         obs_mask_batch = self._trajectory_masks[T_select, padded_B_slice]
         single_obs_batch = self._padded_single_obs_trajectories[T_select, padded_B_slice]
         dones_batch = self._padded_dones_trajectories[T_select, padded_B_slice]
@@ -167,6 +202,8 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
         return RolloutStorageDreamWaQRecurrentV3.MiniBatch(
             obs_batch,
             critic_obs_batch,
+            raw_obs_batch,
+            raw_critic_obs_batch,
             action_batch,
             target_value_batch,
             advantage_batch,

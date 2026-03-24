@@ -7,11 +7,11 @@ from tensorboardX import SummaryWriter
 
 from instinct_rl.algorithms.dreamwaq_v3 import PPODreamWaQRecurrentV3, PPODreamWaQRecurrentV3SGMA
 from instinct_rl.modules.cenet_v3 import CENetV3 as CENet
-from instinct_rl.runners.dreamwaq_v2_runner import DreamWaQRecurrentRunnerV2
+from instinct_rl.runners.on_policy_runner import OnPolicyRunner
 from instinct_rl.utils.utils import store_code_state
 
 
-class DreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV2):
+class DreamWaQRecurrentRunnerV3(OnPolicyRunner):
     """DreamWaQ v3 runner.
 
     V3 keeps the V2 rollout/inference path, but swaps in the sequence-aware
@@ -252,6 +252,175 @@ class DreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV2):
         if hasattr(encoder, "obs_layout"):
             helper_kwargs["obs_layout"] = encoder.obs_layout
         return helper_cls(self.env.get_obs_format(), **helper_kwargs)
+
+    def save(self, path, infos=None):
+        run_state_dict = self.alg.state_dict()
+        run_state_dict["cenet_state_dict"] = self.cenet.state_dict()
+        run_state_dict["optimizer_cenet_state_dict"] = self.alg.optimizer_cenet.state_dict()
+        run_state_dict.update(
+            {
+                f"{group_name}_normalizer_state_dict": normalizer.state_dict()
+                for group_name, normalizer in self.normalizers.items()
+            }
+        )
+        run_state_dict.update(
+            {
+                "iter": self.current_learning_iteration,
+                "infos": infos,
+            }
+        )
+        torch.save(run_state_dict, path)
+
+    def load(self, path):
+        loaded_dict = torch.load(path, map_location=self.device, weights_only=True)
+        self.alg.load_state_dict(loaded_dict)
+        if "cenet_state_dict" in loaded_dict:
+            self.cenet.load_state_dict(loaded_dict["cenet_state_dict"])
+        if "optimizer_cenet_state_dict" in loaded_dict:
+            self.alg.optimizer_cenet.load_state_dict(loaded_dict["optimizer_cenet_state_dict"])
+
+        for group_name, normalizer in self.normalizers.items():
+            key = f"{group_name}_normalizer_state_dict"
+            if key not in loaded_dict:
+                print(
+                    f"\033[1;36m Warning, normalizer for {group_name} is not found, the state dict is not loaded"
+                    " \033[0m"
+                )
+            else:
+                normalizer.load_state_dict(loaded_dict[key])
+
+        self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict["infos"]
+
+    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if dist.is_initialized():
+            self.alg.distributed_data_parallel()
+            print(f"[INFO rank {dist.get_rank()}]: DistributedDataParallel enabled.")
+        if self.log_dir is not None and self.writer is None and (not self.is_mp_rank_other_process()):
+            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
+        obs, extras = self.env.get_observations()
+        obs = obs.to(self.device)
+        critic_obs = extras["observations"].get("critic", None)
+        critic_obs = critic_obs.to(self.device) if critic_obs is not None else None
+        self.train_mode()
+
+        ep_infos = []
+        step_infos = []
+        rframebuffer = [deque(maxlen=2000) for _ in range(self.env.num_rewards)]
+        rewbuffer = [deque(maxlen=100) for _ in range(self.env.num_rewards)]
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, self.env.num_rewards, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        print(
+            "[INFO{}]: Initialization done, start learning.".format(
+                f" rank {dist.get_rank()}" if dist.is_initialized() else ""
+            )
+        )
+        print(
+            "NOTE: you may see a bunch of `NaN or Inf found in input tensor` once and appears in the log. Just ignore"
+            " it if it does not affect the performance."
+        )
+        if self.log_dir is not None and (not self.is_mp_rank_other_process()):
+            store_code_state(self.log_dir, self.git_status_repos)
+        start_iter = self.current_learning_iteration
+        tot_iter = self.current_learning_iteration + num_learning_iterations
+        tot_start_time = time.time()
+        start = time.time()
+        while self.current_learning_iteration < tot_iter:
+            with torch.inference_mode(self.cfg.get("inference_mode_rollout", True)):
+                for _ in range(self.num_steps_per_env):
+                    obs, critic_obs, rewards, dones, infos = self.rollout_step(obs, critic_obs)
+                    if len(rewards.shape) == 1:
+                        rewards = rewards.unsqueeze(-1)
+
+                    if self.log_dir is not None:
+                        if "step" in infos:
+                            step_infos.append(infos["step"])
+                        if "log" in infos:
+                            ep_infos.append(infos["log"])
+                        cur_reward_sum += rewards
+                        cur_episode_length += 1
+                        new_ids = (dones > 0).nonzero(as_tuple=False)[:, 0]
+                        for i in range(self.env.num_rewards):
+                            rframebuffer[i].extend(rewards[dones < 1][:, i].cpu().numpy().tolist())
+                            rewbuffer[i].extend(cur_reward_sum[new_ids][:, i].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+
+                stop = time.time()
+                collection_time = stop - start
+
+                start = stop
+                self.alg.compute_returns(critic_obs if critic_obs is not None else obs)
+
+            losses, stats = self.alg.update(self.current_learning_iteration)
+            stop = time.time()
+            learn_time = stop - start
+            if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
+                self.log(locals())
+            if self.current_learning_iteration % self.save_interval == 0 and self.current_learning_iteration > start_iter:
+                self.save(f"{self.log_dir}/model_{self.current_learning_iteration}.pt")
+            ep_infos.clear()
+            step_infos.clear()
+            self.current_learning_iteration += 1
+            start = time.time()
+
+        self.save(f"{self.log_dir}/model_{self.current_learning_iteration}.pt")
+
+    def rollout_step(self, obs, critic_obs):
+        num_single_obs = self.cenet.decoder.model[-1].out_features
+
+        actions, next_cenet_hidden_states = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
+        self.cenet_hidden_states = next_cenet_hidden_states.detach()
+
+        next_obs, rewards, dones, infos = self.env.step(actions)
+
+        env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
+        if len(env_ids_done) > 0:
+            self.cenet_hidden_states[:, env_ids_done] = 0.0
+
+        next_critic_obs = infos["observations"].get("critic", None)
+        next_obs, next_critic_obs, rewards, dones = (
+            next_obs.to(self.device),
+            next_critic_obs.to(self.device) if next_critic_obs is not None else None,
+            rewards.to(self.device),
+            dones.to(self.device),
+        )
+
+        for obs_group_name, normalizer in self.normalizers.items():
+            if obs_group_name == "policy":
+                next_obs = normalizer(next_obs)
+                infos["observations"]["policy"] = next_obs
+            elif obs_group_name == "critic":
+                if next_critic_obs is not None:
+                    next_critic_obs = normalizer(next_critic_obs)
+                    infos["observations"]["critic"] = next_critic_obs
+            else:
+                if obs_group_name in infos["observations"]:
+                    infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
+
+        if "termination_observations" in infos:
+            term_obs = infos["termination_observations"]
+            if isinstance(term_obs, dict):
+                for k, v in term_obs.items():
+                    if k in self.normalizers:
+                        term_obs[k] = self.normalizers[k](v)
+            else:
+                if "critic" in self.normalizers:
+                    infos["termination_observations"] = self.normalizers["critic"](term_obs)
+
+        rewards_noClip = infos.get("rewards_noClip", rewards)
+        if isinstance(rewards_noClip, torch.Tensor):
+            rewards_noClip = rewards_noClip.to(self.device)
+
+        self.alg.process_env_step(rewards, dones, infos, rewards_noClip, num_single_obs, next_obs, next_critic_obs)
+        return next_obs, next_critic_obs, rewards, dones, infos
 
 
 class SGMADreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV3):

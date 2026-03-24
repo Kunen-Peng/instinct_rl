@@ -136,6 +136,10 @@ class PPODreamWaQCommon(PPO):
         device="cpu",
         **kwargs,
     ):
+        target_mse_ot = kwargs.pop("target_mse_ot", 0.15)
+        beta_delta = kwargs.pop("beta_delta", 1.0)
+        min_vae_beta = kwargs.pop("min_vae_beta", 0.01)
+        max_vae_beta = kwargs.pop("max_vae_beta", 0.5)
         super().__init__(
             actor_critic,
             num_learning_epochs,
@@ -159,10 +163,10 @@ class PPODreamWaQCommon(PPO):
         self.vae_beta = vae_beta
         self.use_Adaboot = use_Adaboot
         self.num_estimator_epochs = num_estimator_epochs
-        self.target_mse_ot = kwargs.pop("target_mse_ot", 0.15)
-        self.beta_delta = kwargs.pop("beta_delta", 1.0)
-        self.min_vae_beta = kwargs.pop("min_vae_beta", 0.01)
-        self.max_vae_beta = kwargs.pop("max_vae_beta", 0.5)
+        self.target_mse_ot = target_mse_ot
+        self.beta_delta = beta_delta
+        self.min_vae_beta = min_vae_beta
+        self.max_vae_beta = max_vae_beta
         self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(5)]
         self.Pboot = torch.tensor(1.0, device=self.device)
         self.optimizer_cenet = optim.Adam(self.cenet.parameters(), lr=learning_rate)
