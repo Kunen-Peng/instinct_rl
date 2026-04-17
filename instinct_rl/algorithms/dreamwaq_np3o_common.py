@@ -4,7 +4,7 @@ from collections import defaultdict, namedtuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Normal
+
 
 from instinct_rl.algorithms.np3o import NP3O
 from instinct_rl.storage.rollout_storage_with_cost import RolloutStorageWithCost
@@ -307,7 +307,10 @@ class DreamWaQNP3OCommon(NP3O):
 class DreamWaQNP3ORecurrentCommon(DreamWaQNP3OCommon):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.transition = RolloutStorageDreamWaQWithCostRecurrent.Transition()
+        if self.cenet.rnn is not None:
+            self.transition = RolloutStorageDreamWaQWithCostRecurrent.Transition()
+        else:
+            self.transition = RolloutStorageDreamWaQWithCost.Transition()
 
     def init_storage(
         self,
@@ -328,37 +331,54 @@ class DreamWaQNP3ORecurrentCommon(DreamWaQNP3OCommon):
             raise ValueError("cost_shape must be provided for DreamWaQNP3O")
         self.k_value = self._to_cost_tensor(self.k_value, cost_shape)
 
-        cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.hidden_size)
-        self.storage = RolloutStorageDreamWaQWithCostRecurrent(
-            num_envs,
-            num_transitions_per_env,
-            [obs_size],
-            [critic_obs_size],
-            [num_actions],
-            num_single_obs,
-            cenet_hidden_state_shape,
-            cost_shape=cost_shape,
-            cost_d_values=cost_d_values,
-            num_rewards=num_rewards,
-            device=self.device,
-        )
+        if self.cenet.rnn is not None:
+            cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.hidden_size)
+            self.storage = RolloutStorageDreamWaQWithCostRecurrent(
+                num_envs,
+                num_transitions_per_env,
+                [obs_size],
+                [critic_obs_size],
+                [num_actions],
+                num_single_obs,
+                cenet_hidden_state_shape,
+                cost_shape=cost_shape,
+                cost_d_values=cost_d_values,
+                num_rewards=num_rewards,
+                device=self.device,
+            )
+        else:
+            # MLP mode — no hidden state storage needed.
+            self.storage = RolloutStorageDreamWaQWithCost(
+                num_envs,
+                num_transitions_per_env,
+                [obs_size],
+                [critic_obs_size],
+                [num_actions],
+                num_single_obs,
+                cost_shape=cost_shape,
+                cost_d_values=cost_d_values,
+                num_rewards=num_rewards,
+                device=self.device,
+            )
 
     def act(self, obs, critic_obs, cenet_hidden_states=None):
-        if obs.dim() == 2:
-            rnn_input = obs.unsqueeze(1)
-        else:
-            rnn_input = obs
+        next_cenet_hidden_states = None
 
-        emb = self.cenet.pre_embedding(rnn_input)
-        rnn_out, next_cenet_hidden_states = self.cenet.rnn(emb, cenet_hidden_states)
-        last_features = rnn_out[:, -1, :]
-        v_mean = self.cenet.v_head(last_features)
-        z_mean = self.cenet.z_mean_head(last_features)
-        z_log_std = self.cenet.z_logstd_head(last_features)
-        z_log_std = torch.clamp(z_log_std, min=-5.0, max=2.0)
-        z_std = torch.exp(z_log_std)
-        z_sampled = Normal(z_mean, z_std).rsample()
-        estimate = torch.cat([v_mean, z_sampled], dim=-1).detach()
+        if self.cenet.rnn is not None:
+            # --- RNN encoder path ---
+            if obs.dim() == 2:
+                rnn_input = obs.unsqueeze(1)
+            else:
+                rnn_input = obs
+
+            emb = self.cenet.pre_embedding(rnn_input)
+            rnn_out, next_cenet_hidden_states = self.cenet.rnn(emb, cenet_hidden_states)
+            last_features = rnn_out[:, -1, :]
+            logits = self.cenet._heads_from_features(last_features)
+            estimate = self.cenet._split_logits_and_sample(logits).detach()
+        else:
+            # --- MLP encoder path ---
+            estimate = self.cenet.encode(obs).detach()
 
         if self.use_estimate:
             final_estimate = estimate
@@ -380,7 +400,13 @@ class DreamWaQNP3ORecurrentCommon(DreamWaQNP3OCommon):
         self.transition.action_sigma = self.actor_critic.action_std.detach()
         self.transition.observations = obs_augmented
         self.transition.critic_observations = critic_obs
-        self.transition.cenet_hidden_states = cenet_hidden_states.permute(1, 0, 2)
+        if cenet_hidden_states is not None and hasattr(self.transition, 'cenet_hidden_states'):
+            self.transition.cenet_hidden_states = cenet_hidden_states.permute(1, 0, 2)
         with torch.no_grad():
             self.transition.cost_values = self._evaluate_cost(val_input).detach()
-        return self.transition.actions, next_cenet_hidden_states
+
+        if next_cenet_hidden_states is not None:
+            return self.transition.actions, next_cenet_hidden_states
+        else:
+            return self.transition.actions
+

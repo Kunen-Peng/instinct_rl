@@ -58,21 +58,36 @@ class DreamWaQRecurrentRunnerV3(OnPolicyRunner):
             if "obs_layout" not in cenet_cfg:
                 cenet_cfg["obs_layout"] = "term_major"
 
+        # Build CENet — pass RNN params only when encoder_type is RNN.
+        encoder_type = cenet_cfg.get("encoder_type", "rnn")
+        cenet_kwargs = dict(cenet_cfg)
+        if encoder_type == "rnn":
+            cenet_kwargs.setdefault("rnn_hidden_size", cenet_kwargs.pop("rnn_hidden_size", 256))
+            cenet_kwargs.setdefault("rnn_num_layers", cenet_kwargs.pop("rnn_num_layers", 1))
+            # rnn_type is not a V2/V3 param; V2 always uses GRU.
+            cenet_kwargs.pop("rnn_type", None)
+        else:
+            # MLP mode — strip RNN-specific keys that may be in the config.
+            cenet_kwargs.pop("rnn_type", None)
+            cenet_kwargs.pop("rnn_hidden_size", None)
+            cenet_kwargs.pop("rnn_num_layers", None)
+
         self.cenet = CENet(
             num_encoder_obs,
             num_single_obs,
-            rnn_type=cenet_cfg.pop("rnn_type", "gru"),
-            rnn_hidden_size=cenet_cfg.pop("rnn_hidden_size", 256),
-            rnn_num_layers=cenet_cfg.pop("rnn_num_layers", 1),
-            **cenet_cfg,
+            **cenet_kwargs,
         ).to(self.device)
 
-        self.cenet_hidden_states = torch.zeros(
-            self.cenet.rnn.num_layers,
-            self.env.num_envs,
-            self.cenet.rnn.hidden_size,
-            device=self.device,
-        )
+        # Hidden states only needed for RNN encoder.
+        if self.cenet.rnn is not None:
+            self.cenet_hidden_states = torch.zeros(
+                self.cenet.rnn.num_layers,
+                self.env.num_envs,
+                self.cenet.rnn.hidden_size,
+                device=self.device,
+            )
+        else:
+            self.cenet_hidden_states = None
 
         est_dim = self.cenet.latent_dim
         obs_format["policy"]["estimator"] = (est_dim,)
@@ -143,43 +158,56 @@ class DreamWaQRecurrentRunnerV3(OnPolicyRunner):
         if "policy" in self.normalizers:
             self.normalizers["policy"].to(device)
 
-        class StatefulPolicy:
-            def __init__(self, runner, device):
-                self.runner = runner
-                self.hidden_states = None
-                self.device = device
+        if self.cenet.rnn is not None:
+            # --- RNN mode: stateful policy with hidden states ---
+            class StatefulPolicy:
+                def __init__(self, runner, device):
+                    self.runner = runner
+                    self.hidden_states = None
+                    self.device = device
 
-            def __call__(self, obs):
-                if self.hidden_states is None:
-                    batch_size = obs.shape[0]
-                    num_layers = self.runner.cenet.rnn.num_layers
-                    hidden_size = self.runner.cenet.rnn.hidden_size
-                    self.hidden_states = torch.zeros(num_layers, batch_size, hidden_size, device=self.device)
+                def __call__(self, obs):
+                    if self.hidden_states is None:
+                        batch_size = obs.shape[0]
+                        num_layers = self.runner.cenet.rnn.num_layers
+                        hidden_size = self.runner.cenet.rnn.hidden_size
+                        self.hidden_states = torch.zeros(num_layers, batch_size, hidden_size, device=self.device)
 
-                if self.hidden_states.device != obs.device:
-                    self.hidden_states = self.hidden_states.to(obs.device)
-                    self.device = obs.device
+                    if self.hidden_states.device != obs.device:
+                        self.hidden_states = self.hidden_states.to(obs.device)
+                        self.device = obs.device
 
-                if "policy" in self.runner.normalizers:
-                    obs_norm = self.runner.normalizers["policy"](obs)
-                else:
-                    obs_norm = obs
-
-                latent_mean, next_states = self.runner.cenet.encoder_inference_recurrent(obs_norm, self.hidden_states)
-                self.hidden_states = next_states
-                obs_aug = torch.cat((obs_norm, latent_mean), dim=-1)
-                return self.runner.alg.actor_critic.act_inference(obs_aug)
-
-            def reset(self, dones=None):
-                if hasattr(self.runner.alg, "actor_critic") and hasattr(self.runner.alg.actor_critic, "reset"):
-                    self.runner.alg.actor_critic.reset(dones)
-                if self.hidden_states is not None:
-                    if dones is None:
-                        self.hidden_states.zero_()
+                    if "policy" in self.runner.normalizers:
+                        obs_norm = self.runner.normalizers["policy"](obs)
                     else:
-                        self.hidden_states[:, dones, :] = 0.0
+                        obs_norm = obs
 
-        return StatefulPolicy(self, device)
+                    latent_mean, next_states = self.runner.cenet.encoder_inference_recurrent(obs_norm, self.hidden_states)
+                    self.hidden_states = next_states
+                    obs_aug = torch.cat((obs_norm, latent_mean), dim=-1)
+                    return self.runner.alg.actor_critic.act_inference(obs_aug)
+
+                def reset(self, dones=None):
+                    if hasattr(self.runner.alg, "actor_critic") and hasattr(self.runner.alg.actor_critic, "reset"):
+                        self.runner.alg.actor_critic.reset(dones)
+                    if self.hidden_states is not None:
+                        if dones is None:
+                            self.hidden_states.zero_()
+                        else:
+                            self.hidden_states[:, dones, :] = 0.0
+
+            return StatefulPolicy(self, device)
+        else:
+            # --- MLP mode: stateless policy ---
+            runner = self
+
+            def policy(obs):
+                obs_norm = runner.normalizers["policy"](obs) if "policy" in runner.normalizers else obs
+                latent = runner.cenet.encoder_inference(obs_norm)
+                obs_aug = torch.cat((obs_norm, latent), dim=-1)
+                return runner.alg.actor_critic.act_inference(obs_aug)
+
+            return policy
 
     def export_as_onnx(self, obs, export_model_dir, filename="policy.onnx"):
         self.eval_mode()
@@ -376,14 +404,19 @@ class DreamWaQRecurrentRunnerV3(OnPolicyRunner):
     def rollout_step(self, obs, critic_obs):
         num_single_obs = self.cenet.decoder.model[-1].out_features
 
-        actions, next_cenet_hidden_states = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
-        self.cenet_hidden_states = next_cenet_hidden_states.detach()
+        act_output = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
+        if isinstance(act_output, tuple):
+            actions, next_cenet_hidden_states = act_output
+            self.cenet_hidden_states = next_cenet_hidden_states.detach()
+        else:
+            actions = act_output
 
         next_obs, rewards, dones, infos = self.env.step(actions)
 
-        env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
-        if len(env_ids_done) > 0:
-            self.cenet_hidden_states[:, env_ids_done] = 0.0
+        if self.cenet_hidden_states is not None:
+            env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
+            if len(env_ids_done) > 0:
+                self.cenet_hidden_states[:, env_ids_done] = 0.0
 
         next_critic_obs = infos["observations"].get("critic", None)
         next_obs, next_critic_obs, rewards, dones = (
@@ -598,15 +631,20 @@ class SymmetryDreamWaQRecurrentRunnerV3(DreamWaQRecurrentRunnerV3):
     def rollout_step(self, obs, critic_obs):
         num_single_obs = self.cenet.decoder.model[-1].out_features
 
-        actions_policy, next_cenet_hidden_states = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
-        self.cenet_hidden_states = next_cenet_hidden_states.detach()
+        act_output = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
+        if isinstance(act_output, tuple):
+            actions_policy, next_cenet_hidden_states = act_output
+            self.cenet_hidden_states = next_cenet_hidden_states.detach()
+        else:
+            actions_policy = act_output
         actions_env = self._mirror_action_tail_to_env(actions_policy)
 
         next_obs, rewards, dones, infos = self.env.step(actions_env)
 
-        env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
-        if len(env_ids_done) > 0:
-            self.cenet_hidden_states[:, env_ids_done] = 0.0
+        if self.cenet_hidden_states is not None:
+            env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
+            if len(env_ids_done) > 0:
+                self.cenet_hidden_states[:, env_ids_done] = 0.0
 
         next_critic_obs = infos["observations"].get("critic", None)
         next_obs, next_critic_obs, rewards, dones = (

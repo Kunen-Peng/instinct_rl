@@ -227,39 +227,35 @@ class RolloutStorageDreamWaQRecurrentV3(RolloutStorageDreamWaQRecurrent):
 
 class PPODreamWaQRecurrentV3(PPODreamWaQRecurrentCommon):
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1, num_single_obs=0):
-        if self.cenet.rnn is None:
-            raise ValueError("PPODreamWaQRecurrentV3 requires a recurrent CENet (rnn is None).")
+        import numpy as np
 
-        cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.hidden_size)
-
-        obs_size = 0
-        for _, v in obs_format["policy"].items():
-            import numpy as np
-
-            obs_size += np.prod(v)
-
-        critic_obs_size = 0
-        if "critic" in obs_format:
-            for _, v in obs_format["critic"].items():
-                import numpy as np
-
-                critic_obs_size += np.prod(v)
-        else:
-            critic_obs_size = None
-
-        self.storage = RolloutStorageDreamWaQRecurrentV3(
-            num_envs,
-            num_transitions_per_env,
-            [obs_size],
-            [critic_obs_size],
-            [num_actions],
-            num_single_obs,
-            cenet_hidden_state_shape,
-            num_rewards=num_rewards,
-            device=self.device,
+        obs_size = sum(np.prod(v) for v in obs_format["policy"].values())
+        critic_obs_size = (
+            sum(np.prod(v) for v in obs_format["critic"].values()) if "critic" in obs_format else None
         )
 
+        if self.cenet.rnn is not None:
+            cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.hidden_size)
+            self.storage = RolloutStorageDreamWaQRecurrentV3(
+                num_envs,
+                num_transitions_per_env,
+                [obs_size],
+                [critic_obs_size],
+                [num_actions],
+                num_single_obs,
+                cenet_hidden_state_shape,
+                num_rewards=num_rewards,
+                device=self.device,
+            )
+        else:
+            # MLP mode — delegate to base class (non-recurrent storage).
+            super().init_storage(
+                num_envs, num_transitions_per_env, obs_format, num_actions,
+                num_rewards=num_rewards, num_single_obs=num_single_obs,
+            )
+
     def _compute_recurrent_estimator_losses(self, minibatch):
+        """Compute estimator losses over padded trajectory batches (RNN only)."""
         lin_vel = get_subobs_by_components(
             minibatch.critic_obs,
             ["base_lin_vel"],
@@ -278,7 +274,29 @@ class PPODreamWaQRecurrentV3(PPODreamWaQRecurrentCommon):
         kl_terms = -0.5 * torch.sum(1 + est_logvar - z_mean.square() - torch.exp(est_logvar), dim=-1)
         kl_loss = kl_terms[valid].mean()
         loss_vt = F.mse_loss(est_mean[..., : self.cenet.dim_v][valid], lin_vel[valid])
-        loss_ot = F.mse_loss(est_obs[valid], minibatch.single_obs[valid])
+        loss_ot = self.compute_weighted_ot_loss(est_obs, minibatch.single_obs, valid)
+        return loss_vt, loss_ot, kl_loss
+
+    def _compute_mlp_estimator_losses(self, minibatch):
+        """Compute estimator losses over flat mini-batches (MLP only)."""
+        lin_vel = get_subobs_by_components(
+            minibatch.critic_obs,
+            ["base_lin_vel"],
+            self.actor_critic.critic_obs_segments,
+        )
+        raw_obs = minibatch.obs[..., : self.cenet.raw_encoder_input_dim]
+        valid = ~minibatch.dones.squeeze(-1).bool()
+
+        z_sample = self.cenet.encode(raw_obs)
+        est_mean = self.cenet.encoder_mean
+        est_logvar = self.cenet.encoder_logvar
+        est_obs = self.cenet.decode(z_sample)
+
+        z_mean = est_mean[..., self.cenet.dim_v :]
+        kl_terms = -0.5 * torch.sum(1 + est_logvar - z_mean.square() - torch.exp(est_logvar), dim=-1)
+        kl_loss = kl_terms[valid].mean()
+        loss_vt = F.mse_loss(est_mean[..., : self.cenet.dim_v][valid], lin_vel[valid])
+        loss_ot = self.compute_weighted_ot_loss(est_obs, minibatch.single_obs, valid)
         return loss_vt, loss_ot, kl_loss
 
     def update(self, current_learning_iteration):
@@ -303,21 +321,40 @@ class PPODreamWaQRecurrentV3(PPODreamWaQRecurrentCommon):
             accumulators["value_loss"] += losses["value_loss"]
             accumulators["surrogate_loss"] += losses["surrogate_loss"]
 
-        estimator_generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        for minibatch in estimator_generator:
-            for _ in range(self.num_estimator_epochs):
-                loss_vt, loss_ot, kl_loss = self._compute_recurrent_estimator_losses(minibatch)
-                cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
+        if self.cenet.rnn is not None:
+            # RNN mode: use recurrent mini-batch generator with padded trajectories.
+            estimator_generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            for minibatch in estimator_generator:
+                for _ in range(self.num_estimator_epochs):
+                    loss_vt, loss_ot, kl_loss = self._compute_recurrent_estimator_losses(minibatch)
+                    cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
 
-                self.optimizer_cenet.zero_grad()
-                cenet_loss.backward()
-                nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
-                self.optimizer_cenet.step()
+                    self.optimizer_cenet.zero_grad()
+                    cenet_loss.backward()
+                    nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
+                    self.optimizer_cenet.step()
 
-                accumulators["loss_vt"] += loss_vt
-                accumulators["loss_ot"] += loss_ot
-                accumulators["loss_kl"] += kl_loss
-                accumulators["loss_est"] += cenet_loss
+                    accumulators["loss_vt"] += loss_vt
+                    accumulators["loss_ot"] += loss_ot
+                    accumulators["loss_kl"] += kl_loss
+                    accumulators["loss_est"] += cenet_loss
+        else:
+            # MLP mode: use standard mini-batch generator.
+            est_generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            for minibatch in est_generator:
+                for _ in range(self.num_estimator_epochs):
+                    loss_vt, loss_ot, kl_loss = self._compute_mlp_estimator_losses(minibatch)
+                    cenet_loss = loss_vt + loss_ot + self.vae_beta * kl_loss
+
+                    self.optimizer_cenet.zero_grad()
+                    cenet_loss.backward()
+                    nn.utils.clip_grad_norm_(self.cenet.parameters(), self.max_grad_norm)
+                    self.optimizer_cenet.step()
+
+                    accumulators["loss_vt"] += loss_vt
+                    accumulators["loss_ot"] += loss_ot
+                    accumulators["loss_kl"] += kl_loss
+                    accumulators["loss_est"] += cenet_loss
 
         return self._finalize_update(accumulators)
 

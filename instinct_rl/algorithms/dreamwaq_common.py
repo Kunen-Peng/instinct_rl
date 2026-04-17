@@ -4,7 +4,7 @@ from collections import namedtuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Normal
+
 
 from instinct_rl.algorithms.ppo import PPO
 from instinct_rl.storage import RolloutStorage
@@ -140,6 +140,9 @@ class PPODreamWaQCommon(PPO):
         beta_delta = kwargs.pop("beta_delta", 1.0)
         min_vae_beta = kwargs.pop("min_vae_beta", 0.01)
         max_vae_beta = kwargs.pop("max_vae_beta", 0.5)
+        ot_component_dims = kwargs.pop("ot_component_dims", None)
+        ot_component_weights = kwargs.pop("ot_component_weights", None)
+        ot_joint_vel_joint_type_weights = kwargs.pop("ot_joint_vel_joint_type_weights", None)
         super().__init__(
             actor_critic,
             num_learning_epochs,
@@ -167,11 +170,74 @@ class PPODreamWaQCommon(PPO):
         self.beta_delta = beta_delta
         self.min_vae_beta = min_vae_beta
         self.max_vae_beta = max_vae_beta
+        self.ot_component_dims = ot_component_dims
+        self.ot_component_weights = ot_component_weights or {}
+        self.ot_joint_vel_joint_type_weights = ot_joint_vel_joint_type_weights or {}
+        self._ot_loss_weight_cache = {}
         self.cenet_loss_list = [torch.tensor(0.0, device=self.device) for _ in range(5)]
         self.Pboot = torch.tensor(1.0, device=self.device)
         self.optimizer_cenet = optim.Adam(self.cenet.parameters(), lr=learning_rate)
         self.use_estimate = False
         self.transition = RolloutStorageDreamWaQ.Transition()
+
+    def _get_default_ot_component_dims(self):
+        return {
+            "base_ang_vel": 3,
+            "projected_gravity": 3,
+            "velocity_commands": 3,
+            "joint_pos": 12,
+            "joint_vel": 12,
+            "actions": 12,
+        }
+
+    def _resolve_ot_component_dims(self):
+        return self.ot_component_dims or self._get_default_ot_component_dims()
+
+    def _get_ot_loss_weights(self, target_dim, device, dtype):
+        cache_key = (target_dim, str(device), str(dtype))
+        if cache_key in self._ot_loss_weight_cache:
+            return self._ot_loss_weight_cache[cache_key]
+
+        component_dims = self._resolve_ot_component_dims()
+        total_dim = sum(int(dim) for dim in component_dims.values())
+        if total_dim != target_dim:
+            raise ValueError(
+                f"DreamWaQ weighted ot loss expects target dim {total_dim}, but got {target_dim}. "
+                "Please keep ot_component_dims aligned with num_single_obs."
+            )
+
+        weights = torch.ones(target_dim, device=device, dtype=dtype)
+        offset = 0
+        for name, dim in component_dims.items():
+            dim = int(dim)
+            component_weight = float(self.ot_component_weights.get(name, 1.0))
+            weights[offset : offset + dim] *= component_weight
+
+            if name == "joint_vel" and self.ot_joint_vel_joint_type_weights:
+                if dim % 3 != 0:
+                    raise ValueError("joint_vel dimension must be divisible by 3 for hip/thigh/calf weighting.")
+                per_type_weights = (
+                    float(self.ot_joint_vel_joint_type_weights.get("hip", 1.0)),
+                    float(self.ot_joint_vel_joint_type_weights.get("thigh", 1.0)),
+                    float(self.ot_joint_vel_joint_type_weights.get("calf", 1.0)),
+                )
+                for joint_idx in range(dim):
+                    weights[offset + joint_idx] *= per_type_weights[joint_idx % 3]
+
+            offset += dim
+
+        self._ot_loss_weight_cache[cache_key] = weights
+        return weights
+
+    def compute_weighted_ot_loss(self, pred_obs, target_obs, valid_mask):
+        pred_valid = pred_obs[valid_mask]
+        target_valid = target_obs[valid_mask]
+        if pred_valid.numel() == 0:
+            return pred_obs.new_tensor(0.0)
+
+        weights = self._get_ot_loss_weights(target_valid.shape[-1], target_valid.device, target_valid.dtype)
+        sq_error = (pred_valid - target_valid).square() * weights
+        return sq_error.mean()
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1, num_single_obs=0):
         obs_size = 0
@@ -325,58 +391,63 @@ class PPODreamWaQCommon(PPO):
 class PPODreamWaQRecurrentCommon(PPODreamWaQCommon):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.transition = RolloutStorageDreamWaQRecurrent.Transition()
+        if self.cenet.rnn is not None:
+            self.transition = RolloutStorageDreamWaQRecurrent.Transition()
+        else:
+            self.transition = RolloutStorageDreamWaQ.Transition()
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1, num_single_obs=0):
-        if self.cenet.rnn is None:
-            raise ValueError("PPODreamWaQRecurrent requires a recurrent CENet (rnn is None).")
+        import numpy as np
 
-        cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.hidden_size)
-
-        obs_size = 0
-        for _, v in obs_format["policy"].items():
-            import numpy as np
-
-            obs_size += np.prod(v)
-
-        critic_obs_size = 0
-        if "critic" in obs_format:
-            for _, v in obs_format["critic"].items():
-                import numpy as np
-
-                critic_obs_size += np.prod(v)
-        else:
-            critic_obs_size = None
-
-        self.storage = RolloutStorageDreamWaQRecurrent(
-            num_envs,
-            num_transitions_per_env,
-            [obs_size],
-            [critic_obs_size],
-            [num_actions],
-            num_single_obs,
-            cenet_hidden_state_shape,
-            num_rewards=num_rewards,
-            device=self.device,
+        obs_size = sum(np.prod(v) for v in obs_format["policy"].values())
+        critic_obs_size = (
+            sum(np.prod(v) for v in obs_format["critic"].values()) if "critic" in obs_format else None
         )
 
-    def act(self, obs, critic_obs, cenet_hidden_states=None):
-        if obs.dim() == 2:
-            rnn_input = obs.unsqueeze(1)
+        if self.cenet.rnn is not None:
+            cenet_hidden_state_shape = (self.cenet.rnn.num_layers, self.cenet.rnn.hidden_size)
+            self.storage = RolloutStorageDreamWaQRecurrent(
+                num_envs,
+                num_transitions_per_env,
+                [obs_size],
+                [critic_obs_size],
+                [num_actions],
+                num_single_obs,
+                cenet_hidden_state_shape,
+                num_rewards=num_rewards,
+                device=self.device,
+            )
         else:
-            rnn_input = obs
+            # MLP mode — no hidden state storage needed.
+            self.storage = RolloutStorageDreamWaQ(
+                num_envs,
+                num_transitions_per_env,
+                [obs_size],
+                [critic_obs_size],
+                [num_actions],
+                num_single_obs,
+                num_rewards=num_rewards,
+                device=self.device,
+            )
 
-        emb = self.cenet.pre_embedding(rnn_input)
-        rnn_out, next_cenet_hidden_states = self.cenet.rnn(emb, cenet_hidden_states)
-        last_features = rnn_out[:, -1, :]
+    def act(self, obs, critic_obs, cenet_hidden_states=None):
+        next_cenet_hidden_states = None
 
-        v_mean = self.cenet.v_head(last_features)
-        z_mean = self.cenet.z_mean_head(last_features)
-        z_log_std = self.cenet.z_logstd_head(last_features)
-        z_log_std = torch.clamp(z_log_std, min=-5.0, max=2.0)
-        z_std = torch.exp(z_log_std)
-        z_sampled = Normal(z_mean, z_std).rsample()
-        estimate = torch.cat([v_mean, z_sampled], dim=-1).detach()
+        if self.cenet.rnn is not None:
+            # --- RNN encoder path ---
+            if obs.dim() == 2:
+                rnn_input = obs.unsqueeze(1)
+            else:
+                rnn_input = obs
+
+            emb = self.cenet.pre_embedding(rnn_input)
+            rnn_out, next_cenet_hidden_states = self.cenet.rnn(emb, cenet_hidden_states)
+            last_features = rnn_out[:, -1, :]
+            logits = self.cenet._heads_from_features(last_features)
+            estimate = self.cenet._split_logits_and_sample(logits).detach()
+        else:
+            # --- MLP encoder path ---
+            estimate = self.cenet.encode(obs).detach()
 
         if self.use_estimate:
             final_estimate = estimate
@@ -399,6 +470,10 @@ class PPODreamWaQRecurrentCommon(PPODreamWaQCommon):
         self.transition.action_sigma = self.actor_critic.action_std.detach()
         self.transition.observations = obs_augmented
         self.transition.critic_observations = critic_obs
-        if cenet_hidden_states is not None:
+        if cenet_hidden_states is not None and hasattr(self.transition, 'cenet_hidden_states'):
             self.transition.cenet_hidden_states = cenet_hidden_states.permute(1, 0, 2)
-        return self.transition.actions, next_cenet_hidden_states
+
+        if next_cenet_hidden_states is not None:
+            return self.transition.actions, next_cenet_hidden_states
+        else:
+            return self.transition.actions

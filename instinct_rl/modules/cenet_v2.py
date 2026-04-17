@@ -20,73 +20,117 @@ class MLP(nn.Module):
 
 
 class CENetV2(nn.Module):
-    def __init__(self,
-                 num_encoder_obs,
-                 num_decoder_obs,
-                 num_est_v=3, 
-                 num_est_z=16,
-                 decoder_hidden_dim=[256, 128],
-                 activation=nn.ELU(),
-                 rnn_hidden_size=256,  # GRU 隐藏层维度，可通过 cenet 配置覆盖
-                 rnn_num_layers=2,     # GRU 层数，可通过 cenet 配置覆盖
-                 pre_embedding_dim=128, # Pre-Embedding 输出维度（GRU 的 input_size）
-                 physical_heads_num_layers=1, # 速度头深度（1代表仅Linear, 2代表Linear->ELU->Linear）
-                 **kwargs):
+    """Context-Encoder Network (V2).
+
+    Supports two encoder backends:
+
+    * ``encoder_type="rnn"`` (default) — Pre-embedding → GRU → decoupled heads.
+      The runner manages hidden states externally.
+    * ``encoder_type="mlp"`` — A simple MLP encoder (no recurrence).  This is
+      useful for non-recurrent DreamWaQ variants and maintains the same output
+      interface (``encode`` / ``encoder_inference`` / ``encoder_inference_recurrent``).
+    """
+
+    def __init__(
+        self,
+        num_encoder_obs,
+        num_decoder_obs,
+        num_est_v=3,
+        num_est_z=16,
+        decoder_hidden_dim=[256, 128],
+        activation=nn.ELU(),
+        # --- Encoder-type selection ---
+        encoder_type="rnn",  # "rnn" or "mlp"
+        # --- RNN-specific params (ignored when encoder_type="mlp") ---
+        rnn_hidden_size=256,
+        rnn_num_layers=2,
+        pre_embedding_dim=128,
+        physical_heads_num_layers=1,
+        # --- MLP-specific params (ignored when encoder_type="rnn") ---
+        encoder_hidden_dim=None,  # e.g. [256, 128]
+        **kwargs,
+    ):
         super(CENetV2, self).__init__()
-        
+
         self.dim_v = num_est_v  # 3
         self.dim_z = num_est_z  # 16
-        
-        # 实际的 Latent 维度 (Policy 和 Decoder 看到的维度) = 3 + 16 = 19
-        self.latent_dim = num_est_v + num_est_z
-        
-        self.raw_encoder_input_dim = num_encoder_obs
-        
-        # 阶段一：前置嵌入 (Pre-Embedding)
-        # 将原始观测映射到固定维度，作为 GRU 的输入序列
-        self.pre_embedding = nn.Sequential(
-            nn.Linear(num_encoder_obs, pre_embedding_dim),
-            nn.LayerNorm(pre_embedding_dim),
-            nn.ELU()
-        )
-        
-        # 阶段一：升级 GRU 主干（层数和隐藏维度由配置文件控制）
-        self.rnn = nn.GRU(
-            input_size=pre_embedding_dim,
-            hidden_size=rnn_hidden_size,
-            num_layers=rnn_num_layers,
-            batch_first=True
-        )
-        
-        # 阶段一：彻底拆分解耦输出头 (Decoupled Heads)
-        # 所有 Head 的输入维度 = rnn_hidden_size
-        # 速度预测头 (只处理物理量，根据设计哲学可能需要更深网络映射抽象特征)
-        if physical_heads_num_layers == 1:
-            self.v_head = nn.Linear(rnn_hidden_size, 3)
-        else:
-            self.v_head = nn.Sequential(
-                nn.Linear(rnn_hidden_size, max(32, rnn_hidden_size // 4)),
-                nn.ELU(),
-                nn.Linear(max(32, rnn_hidden_size // 4), 3)
-            )
-        
-        # 隐变量均值头
-        self.z_mean_head = nn.Linear(rnn_hidden_size, num_est_z)
-        
-        # 隐变量方差头
-        self.z_logstd_head = nn.Linear(rnn_hidden_size, num_est_z)
-        
-        # Decoder 输入 19 维 (self.latent_dim=19)
-        self.decoder = MLP(input_dim=self.latent_dim, 
-                           hidden_dims=decoder_hidden_dim, 
-                           output_dim=num_decoder_obs,
-                           activation=activation)
+        self.latent_dim = num_est_v + num_est_z           # 19
+        self.encoder_output_dim = num_est_v + num_est_z * 2  # 35
 
-        # 初始化缓存变量
+        self.raw_encoder_input_dim = num_encoder_obs
+        self.encoder_type = encoder_type
+
+        # ------------------------------------------------------------------
+        # Build encoder
+        # ------------------------------------------------------------------
+        if encoder_type == "mlp":
+            # ---- MLP encoder ----
+            if encoder_hidden_dim is None:
+                encoder_hidden_dim = [256, 128]
+            self.encoder = MLP(
+                input_dim=num_encoder_obs,
+                hidden_dims=encoder_hidden_dim,
+                output_dim=self.encoder_output_dim,
+                activation=activation,
+            )
+            # RNN-specific attributes are None so callers can check.
+            self.pre_embedding = None
+            self.rnn = None
+            self.v_head = None
+            self.z_mean_head = None
+            self.z_logstd_head = None
+
+        elif encoder_type == "rnn":
+            # ---- RNN (GRU) encoder ----
+            self.encoder = None  # not used in RNN mode
+
+            self.pre_embedding = nn.Sequential(
+                nn.Linear(num_encoder_obs, pre_embedding_dim),
+                nn.LayerNorm(pre_embedding_dim),
+                nn.ELU(),
+            )
+            self.rnn = nn.GRU(
+                input_size=pre_embedding_dim,
+                hidden_size=rnn_hidden_size,
+                num_layers=rnn_num_layers,
+                batch_first=True,
+            )
+
+            # Decoupled output heads
+            if physical_heads_num_layers == 1:
+                self.v_head = nn.Linear(rnn_hidden_size, num_est_v)
+            else:
+                mid = max(32, rnn_hidden_size // 4)
+                self.v_head = nn.Sequential(
+                    nn.Linear(rnn_hidden_size, mid),
+                    nn.ELU(),
+                    nn.Linear(mid, num_est_v),
+                )
+            self.z_mean_head = nn.Linear(rnn_hidden_size, num_est_z)
+            self.z_logstd_head = nn.Linear(rnn_hidden_size, num_est_z)
+
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type!r}. Must be 'rnn' or 'mlp'.")
+
+        # ------------------------------------------------------------------
+        # Decoder (shared by both modes)
+        # ------------------------------------------------------------------
+        self.decoder = MLP(
+            input_dim=self.latent_dim,
+            hidden_dims=decoder_hidden_dim,
+            output_dim=num_decoder_obs,
+            activation=activation,
+        )
+
+        # Cached encoder outputs (set during encode())
         self.full_mean = None
         self.z_logvar = None
-        
+
         Normal.set_default_validate_args = False
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
 
     @staticmethod
     def init_weights(sequential, scales):
@@ -94,8 +138,6 @@ class CENetV2(nn.Module):
          enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))]
 
     def reset(self, dones=None):
-        # Memory resetting is typically handled externally in the runner,
-        # but we preserve the interface here.
         pass
 
     def forward(self):
@@ -103,100 +145,137 @@ class CENetV2(nn.Module):
 
     @property
     def encoder_mean(self):
-        return self.full_mean # [Batch, 19]
+        return self.full_mean  # [Batch, 19]
 
     @property
     def encoder_logvar(self):
-        return self.z_logvar # [Batch, 16]
+        return self.z_logvar  # [Batch, 16]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _heads_from_features(self, features):
+        """Apply decoupled heads to RNN output features.
+
+        Args:
+            features: ``(Batch, rnn_hidden_size)`` or ``(Batch, SeqLen, rnn_hidden_size)``
+
+        Returns:
+            logits: ``(Batch, 35)`` or ``(Batch, SeqLen, 35)``
+        """
+        v_mean = self.v_head(features)
+        z_mean = self.z_mean_head(features)
+        z_logstd = self.z_logstd_head(features)
+        return torch.cat([v_mean, z_mean, z_logstd], dim=-1)
+
+    def _split_logits_and_sample(self, logits):
+        """Split 35-dim encoder logits → sample latent, cache mean/logvar.
+
+        Works for both 2-D ``(B, 35)`` and 3-D ``(B, S, 35)`` inputs.
+
+        Returns:
+            full_sampled: ``(..., 19)`` concatenation of ``[v_mean, z_sampled]``
+        """
+        v_mean = logits[..., : self.dim_v]
+        z_params = logits[..., self.dim_v :]
+        z_mean, z_log_std = torch.chunk(z_params, 2, dim=-1)
+
+        self.full_mean = torch.cat([v_mean, z_mean], dim=-1)
+
+        z_log_std = torch.clamp(z_log_std, min=-5.0, max=2.0)
+        z_std = torch.exp(z_log_std)
+        z_sampled = Normal(z_mean, z_std).rsample()
+
+        self.z_logvar = 2 * z_log_std
+
+        return torch.cat([v_mean, z_sampled], dim=-1)
+
+    def _split_logits_mean_only(self, logits):
+        """Return deterministic mean ``[v_mean, z_mean]`` from encoder logits."""
+        v_mean = logits[..., : self.dim_v]
+        z_mean = logits[..., self.dim_v : self.dim_v + self.dim_z]
+        return torch.cat([v_mean, z_mean], dim=-1)
+
+    # ------------------------------------------------------------------
+    # Encode
+    # ------------------------------------------------------------------
 
     def encode(self, observations, hidden_states=None, masks=None, **kwargs):
+        """Encode observations to latent.
+
+        Args:
+            observations: ``(B, D)`` or ``(B, SeqLen, D)``
+            hidden_states: RNN hidden states (ignored in MLP mode)
+            masks: sequence masks (ignored in MLP mode)
+
+        Returns:
+            full_sampled: ``(..., 19)``
         """
-        observations: (Batch, Dim) or (Batch, Seq_Len, Dim)
-        hidden_states: (Num_layers, Batch, Hidden_size) expected
-        """
-        # Ensure observations is 3D for batch_first=True RNN
+        if self.encoder_type == "mlp":
+            logits = self.encoder(observations)
+            return self._split_logits_and_sample(logits)
+
+        # --- RNN path ---
         if observations.dim() == 2:
-            rnn_input = observations.unsqueeze(1)  # (Batch, 1, Dim)
-        elif observations.dim() == 3 and not self.rnn.batch_first:
-             # Just in case, though we hardcoded batch_first=True.
-             pass
+            rnn_input = observations.unsqueeze(1)
         else:
             rnn_input = observations
 
-        # 1. Pre-Embedding
-        emb = self.pre_embedding(rnn_input) # (Batch, Seq_len, 128)
-        
-        # 2. GRU
+        emb = self.pre_embedding(rnn_input)
         if hidden_states is not None:
-             rnn_out, _ = self.rnn(emb, hidden_states)
+            rnn_out, _ = self.rnn(emb, hidden_states)
         else:
-             rnn_out, _ = self.rnn(emb)
-             
-        # Extract the last feature for each sequence
-        last_features = rnn_out[:, -1, :] # (Batch, 256)
-        
-        # 3. Decoupled Heads
-        v_mean = self.v_head(last_features)
-        z_mean = self.z_mean_head(last_features)
-        z_log_std = self.z_logstd_head(last_features)
-        
-        # 拼接完整的 Mean (用于 Loss 计算) -> [Batch, 19]
-        self.full_mean = torch.cat([v_mean, z_mean], dim=-1)
-        
-        # 处理 Std 和 采样 (仅针对 z)
-        z_log_std = torch.clamp(z_log_std, min=-5.0, max=2.0)
-        z_std = torch.exp(z_log_std)
-        
-        # 重参数化采样 z: [Batch, 16]
-        z_sampled = Normal(z_mean, z_std).rsample()
-        
-        # Concat into final latent (Decoder input) -> [Batch, 19]
-        full_sampled = torch.cat([v_mean, z_sampled], dim=-1)
-        
-        # 保存 z 的 log_std (x2 转为 logvar) 供 KL Loss 使用
-        self.z_logvar = 2 * z_log_std
-        
-        return full_sampled
+            rnn_out, _ = self.rnn(emb)
+
+        last_features = rnn_out[:, -1, :]
+        logits = self._heads_from_features(last_features)
+        return self._split_logits_and_sample(logits)
+
+    # ------------------------------------------------------------------
+    # Decode
+    # ------------------------------------------------------------------
 
     def decode(self, decoder_obs):
-        # decoder_obs 应该是 19 维的 full_sampled
-        est_obs = self.decoder(decoder_obs)
-        return est_obs
+        return self.decoder(decoder_obs)
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
 
     def encoder_inference(self, observations):
-        """推理模式：只返回确定性的均值 (v_mean + z_mean)"""
-        # Ensure 3D (Batch, 1, Dim)
+        """Inference mode: return deterministic mean ``(v_mean + z_mean)``."""
+        if self.encoder_type == "mlp":
+            logits = self.encoder(observations)
+            return self._split_logits_mean_only(logits)
+
+        # --- RNN path ---
         if observations.dim() == 2:
             observations = observations.unsqueeze(1)
-            
+
         emb = self.pre_embedding(observations)
         rnn_out, _ = self.rnn(emb, None)
         last_features = rnn_out[:, -1, :]
-        
-        v_mean = self.v_head(last_features)
-        z_mean = self.z_mean_head(last_features)
-        
-        # 阶段四：推理只需拼接 v_mean 和 z_mean
-        return torch.cat((v_mean, z_mean), dim=-1)
-    
+        logits = self._heads_from_features(last_features)
+        return self._split_logits_mean_only(logits)
+
     def encoder_inference_recurrent(self, observations, hidden_states=None):
-        """显式支持 state 的 inference 接口"""
+        """Inference with explicit hidden-state management.
+
+        In MLP mode ``next_hidden_states`` is always ``None``.
+        """
+        if self.encoder_type == "mlp":
+            logits = self.encoder(observations)
+            return self._split_logits_mean_only(logits), None
+
+        # --- RNN path ---
         if observations.dim() == 2:
-            rnn_input = observations.unsqueeze(1) # (Batch, 1, Dim)
+            rnn_input = observations.unsqueeze(1)
         else:
             rnn_input = observations
-            
+
         emb = self.pre_embedding(rnn_input)
-        
-        # hidden_states: (Num_layers, Batch, Hidden_size) = (2, B, 256)
         rnn_out, next_hidden_states = self.rnn(emb, hidden_states)
-        
-        last_features = rnn_out[:, -1, :] # (Batch, 256)
-        
-        v_mean = self.v_head(last_features)
-        z_mean = self.z_mean_head(last_features)
-        
-        # 阶段四：推理只需拼接 v_mean 和 z_mean
-        v_full_mean = torch.cat((v_mean, z_mean), dim=-1)
-        
-        return v_full_mean, next_hidden_states
+        last_features = rnn_out[:, -1, :]
+        logits = self._heads_from_features(last_features)
+        return self._split_logits_mean_only(logits), next_hidden_states

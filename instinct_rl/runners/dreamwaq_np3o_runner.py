@@ -9,7 +9,7 @@ from tensorboardX import SummaryWriter
 
 import instinct_rl
 import instinct_rl.algorithms as algorithms
-from instinct_rl.modules import CENet
+from instinct_rl.modules.cenet_v3 import CENetV3 as CENet
 from instinct_rl.runners.on_constraint_policy_runner import OnConstraintPolicyRunner
 from instinct_rl.utils.utils import get_subobs_size, store_code_state
 
@@ -35,7 +35,20 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
             cenet_cfg = self.alg_cfg.pop("cenet")
         elif "cenet" in self.cfg:
             cenet_cfg = self.cfg["cenet"]
-        self.cenet = CENet(num_encoder_obs, num_single_obs, **cenet_cfg).to(self.device)
+
+        # Process cenet_cfg: strip RNN-specific keys that V2/V3 CENet doesn't accept.
+        cenet_kwargs = dict(cenet_cfg)
+        encoder_type = cenet_kwargs.get("encoder_type", "rnn")
+        if encoder_type == "rnn":
+            cenet_kwargs.setdefault("rnn_hidden_size", cenet_kwargs.pop("rnn_hidden_size", 256))
+            cenet_kwargs.setdefault("rnn_num_layers", cenet_kwargs.pop("rnn_num_layers", 1))
+            cenet_kwargs.pop("rnn_type", None)
+        else:
+            cenet_kwargs.pop("rnn_type", None)
+            cenet_kwargs.pop("rnn_hidden_size", None)
+            cenet_kwargs.pop("rnn_num_layers", None)
+
+        self.cenet = CENet(num_encoder_obs, num_single_obs, **cenet_kwargs).to(self.device)
 
         obs_format = env.get_obs_format()
         est_dim = self.cenet.latent_dim
@@ -105,7 +118,17 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         self.log_interval = self.cfg.get("log_interval", 1)
         self.git_status_repos = [instinct_rl.__file__]
         self._cost_buffer = deque(maxlen=100)
-        self.cenet_hidden_states = None
+
+        # Hidden states only needed for RNN encoder.
+        if self.cenet.rnn is not None:
+            self.cenet_hidden_states = torch.zeros(
+                self.cenet.rnn.num_layers,
+                self.env.num_envs,
+                self.cenet.rnn.hidden_size,
+                device=self.device,
+            )
+        else:
+            self.cenet_hidden_states = None
 
         _, _ = self.env.reset()
 
@@ -218,13 +241,52 @@ class DreamWaQNP3ORunner(OnConstraintPolicyRunner):
         if "policy" in self.normalizers:
             self.normalizers["policy"].to(device)
 
-        def policy(obs):
-            obs_norm = self.normalizers["policy"](obs) if "policy" in self.normalizers else obs
-            latent = self.cenet.encoder_inference(obs_norm)
-            obs_aug = torch.cat((obs_norm, latent), dim=-1)
-            return self.alg.actor_critic.act_inference(obs_aug)
+        if self.cenet.rnn is not None:
+            # --- RNN mode: stateful policy with hidden states ---
+            class StatefulPolicy:
+                def __init__(self, runner, device):
+                    self.runner = runner
+                    self.hidden_states = None
+                    self.device = device
 
-        return policy
+                def __call__(self, obs):
+                    if self.hidden_states is None:
+                        batch_size = obs.shape[0]
+                        num_layers = self.runner.cenet.rnn.num_layers
+                        hidden_size = self.runner.cenet.rnn.hidden_size
+                        self.hidden_states = torch.zeros(num_layers, batch_size, hidden_size, device=self.device)
+
+                    if self.hidden_states.device != obs.device:
+                        self.hidden_states = self.hidden_states.to(obs.device)
+                        self.device = obs.device
+
+                    obs_norm = self.runner.normalizers["policy"](obs) if "policy" in self.runner.normalizers else obs
+                    latent_mean, next_states = self.runner.cenet.encoder_inference_recurrent(obs_norm, self.hidden_states)
+                    self.hidden_states = next_states
+                    obs_aug = torch.cat((obs_norm, latent_mean), dim=-1)
+                    return self.runner.alg.actor_critic.act_inference(obs_aug)
+
+                def reset(self, dones=None):
+                    if hasattr(self.runner.alg, "actor_critic") and hasattr(self.runner.alg.actor_critic, "reset"):
+                        self.runner.alg.actor_critic.reset(dones)
+                    if self.hidden_states is not None:
+                        if dones is None:
+                            self.hidden_states.zero_()
+                        else:
+                            self.hidden_states[:, dones, :] = 0.0
+
+            return StatefulPolicy(self, device)
+        else:
+            # --- MLP mode: stateless policy ---
+            runner = self
+
+            def policy(obs):
+                obs_norm = runner.normalizers["policy"](obs) if "policy" in runner.normalizers else obs
+                latent = runner.cenet.encoder_inference(obs_norm)
+                obs_aug = torch.cat((obs_norm, latent), dim=-1)
+                return runner.alg.actor_critic.act_inference(obs_aug)
+
+            return policy
 
     def export_as_onnx(self, obs, export_model_dir, filename="policy.onnx"):
         self.eval_mode()
@@ -419,16 +481,21 @@ class SymmetryDreamWaQNP3ORunnerV3(DreamWaQNP3ORunner):
     def rollout_step(self, obs, critic_obs):
         num_single_obs = self.cenet.decoder.model[-1].out_features
 
-        actions_policy, next_cenet_hidden_states = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
-        self.cenet_hidden_states = next_cenet_hidden_states.detach()
+        act_output = self.alg.act(obs, critic_obs, self.cenet_hidden_states)
+        if isinstance(act_output, tuple):
+            actions_policy, next_cenet_hidden_states = act_output
+            self.cenet_hidden_states = next_cenet_hidden_states.detach()
+        else:
+            actions_policy = act_output
         actions_env = self._mirror_action_tail_to_env(actions_policy)
 
         next_obs, rewards, dones, infos = self.env.step(actions_env)
         costs = self._extract_costs(infos)
 
-        env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
-        if len(env_ids_done) > 0:
-            self.cenet_hidden_states[:, env_ids_done] = 0.0
+        if self.cenet_hidden_states is not None:
+            env_ids_done = dones.nonzero(as_tuple=False).squeeze(-1)
+            if len(env_ids_done) > 0:
+                self.cenet_hidden_states[:, env_ids_done] = 0.0
 
         next_critic_obs = infos["observations"].get("critic", None)
         next_obs, next_critic_obs, rewards, dones = (
